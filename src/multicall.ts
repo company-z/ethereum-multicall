@@ -391,15 +391,11 @@ export class Multicall {
         )
         .call(...callParams)) as AggregateContractResponse;
 
-      contractResponse.blockNumber = contractResponse.blockNumber;
-
       return this.buildUpAggregateResponse(contractResponse, calls);
     } else {
       const contractResponse = (await contract.methods
         .aggregate(this.mapCallContextToMatchContractFormat(calls))
         .call(...callParams)) as AggregateContractResponse;
-
-      contractResponse.blockNumber = contractResponse.blockNumber;
 
       return this.buildUpAggregateResponse(contractResponse, calls);
     }
