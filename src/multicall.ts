@@ -279,9 +279,13 @@ export class Multicall {
     }
 
     if (Array.isArray(decodedReturnResults)) {
+        decodedReturnResults = decodedReturnResults.map((c) => {
+          if (typeof c === "bigint") return c.toString()
+          return c
+        })
       return decodedReturnResults;
     }
-
+    if (typeof decodedReturnResults === "bigint")  return [decodedReturnResults.toString()]
     return [decodedReturnResults];
   }
 
@@ -463,6 +467,7 @@ export class Multicall {
         this.mapCallContextToMatchContractFormat(calls),
         overrideOptions
       )) as AggregateContractResponse;
+
 
       return this.buildUpAggregateResponse(contractResponse, calls);
     }
