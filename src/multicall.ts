@@ -136,6 +136,7 @@ export class Multicall {
           pipelining: 1,
           keepAliveTimeout: 30000,
           keepAliveMaxTimeout: 60000,
+          allowH2: true
         });
       }
       return;
