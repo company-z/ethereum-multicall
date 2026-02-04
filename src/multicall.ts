@@ -1,5 +1,6 @@
 import { BigNumber, ethers } from 'ethers';
 import { defaultAbiCoder } from 'ethers/lib/utils';
+import { fetch, Pool } from 'undici';
 import { ExecutionType, Networks } from './enums';
 import {
   AbiItem,
@@ -102,6 +103,10 @@ export class Multicall {
   ];
 
   private _executionType: ExecutionType;
+  private _cachedProvider?: ethers.providers.Provider;
+  private _cachedNetworkId?: number;
+  private _httpPool?: Pool;
+  private _multicallInterface?: ethers.utils.Interface;
 
   constructor(
     private _options:
@@ -121,6 +126,19 @@ export class Multicall {
 
     if ((this._options as MulticallOptionsCustomJsonRpcProvider).nodeUrl) {
       this._executionType = ExecutionType.customHttp;
+      
+      // Initialize undici pool for high-performance HTTP if enabled
+      if (this._options.useUndici) {
+        const nodeUrl = (this._options as MulticallOptionsCustomJsonRpcProvider).nodeUrl;
+        const url = new URL(nodeUrl);
+        this._httpPool = new Pool(url.origin, {
+          connections: 100,
+          pipelining: 1,
+          keepAliveTimeout: 30000,
+          keepAliveMaxTimeout: 60000,
+          allowH2: true
+        });
+      }
       return;
     }
 
@@ -129,7 +147,27 @@ export class Multicall {
       'Your options passed in our incorrect they need to match either `MulticallOptionsEthers`, `MulticallOptionsWeb3` or `MulticallOptionsCustomJsonRpcProvider` interfaces'
     );
   }
-
+  
+  /**
+   * Close the HTTP pool connection (call when done with multicall instance)
+   */
+  public async close(): Promise<void> {
+    if (this._httpPool) {
+      await this._httpPool.close();
+      this._httpPool = undefined;
+    }
+  }
+  
+  /**
+   * Get or create the multicall interface for encoding/decoding
+   */
+  private getMulticallInterface(): ethers.utils.Interface {
+    if (!this._multicallInterface) {
+      this._multicallInterface = new ethers.utils.Interface(this.ABI);
+    }
+    return this._multicallInterface;
+  }
+  
   /**
    * Call all the contract calls in 1
    * @param calls The calls
@@ -357,11 +395,94 @@ export class Multicall {
     calls: AggregateCallContext[],
     options: ContractCallOptions
   ): Promise<AggregateResponse> {
+    // Split calls into batches if batchSize is configured
+    const batchSize = this._options.batchSize;
+    if (batchSize && batchSize > 0 && calls.length > batchSize) {
+      return await this.executeInBatches(calls, options, batchSize);
+    }
+    
+    return await this.executeSingleBatch(calls, options);
+  }
+  
+  /**
+   * Execute calls in parallel batches
+   * @param calls The calls
+   * @param options Call options
+   * @param batchSize Max calls per batch
+   */
+  private async executeInBatches(
+    calls: AggregateCallContext[],
+    options: ContractCallOptions,
+    batchSize: number
+  ): Promise<AggregateResponse> {
+    const batches: AggregateCallContext[][] = [];
+    for (let i = 0; i < calls.length; i += batchSize) {
+      batches.push(calls.slice(i, i + batchSize));
+    }
+    
+    const results = await Promise.all(
+      batches.map(batch => this.executeSingleBatch(batch, options))
+    );
+    
+    return this.mergeAggregateResponses(results);
+  }
+  
+  /**
+   * Merge multiple aggregate responses into one
+   * @param responses The responses to merge
+   */
+  private mergeAggregateResponses(
+    responses: AggregateResponse[]
+  ): AggregateResponse {
+    if (responses.length === 0) {
+      throw new Error('No responses to merge');
+    }
+    
+    const merged: AggregateResponse = {
+      blockNumber: responses[0].blockNumber,
+      results: [],
+    };
+    
+    // Use a Map for efficient merging
+    const resultMap = new Map<number, AggregateResponse['results'][0]>();
+    
+    for (const response of responses) {
+      for (const result of response.results) {
+        const existing = resultMap.get(result.contractContextIndex);
+        if (existing) {
+          existing.methodResults.push(...result.methodResults);
+        } else {
+          resultMap.set(result.contractContextIndex, {
+            contractContextIndex: result.contractContextIndex,
+            methodResults: [...result.methodResults],
+          });
+        }
+      }
+    }
+    
+    merged.results = Array.from(resultMap.values());
+    return merged;
+  }
+  
+  /**
+   * Execute a single batch of calls
+   * @param calls The calls
+   * @param options Call options
+   */
+  private async executeSingleBatch(
+    calls: AggregateCallContext[],
+    options: ContractCallOptions
+  ): Promise<AggregateResponse> {
     switch (this._executionType) {
       case ExecutionType.web3:
         return await this.executeWithWeb3(calls, options);
       case ExecutionType.ethers:
+        return await this.executeWithEthersOrCustom(calls, options);
       case ExecutionType.customHttp:
+        // Use undici if enabled, otherwise fall back to ethers
+        if (this._options.useUndici && this._httpPool) {
+          return await this.executeWithUndici(calls, options);
+        }
         return await this.executeWithEthersOrCustom(calls, options);
       default:
         throw new Error(`${this._executionType} is not defined`);
@@ -377,7 +498,12 @@ export class Multicall {
     options: ContractCallOptions
   ): Promise<AggregateResponse> {
     const web3 = this.getTypedOptions<MulticallOptionsWeb3>().web3Instance;
-    const networkId = this._options.networkId || (await web3.eth.net.getId());
+    
+    // Cache network ID for subsequent calls
+    if (!this._cachedNetworkId && !this._options.networkId) {
+      this._cachedNetworkId = await web3.eth.net.getId();
+    }
+    const networkId = this._options.networkId || this._cachedNetworkId!;
     const contract = new web3.eth.Contract(
       this.ABI,
       this.getContractBasedOnNetwork(networkId)
@@ -420,26 +546,11 @@ export class Multicall {
     calls: AggregateCallContext[],
     options: ContractCallOptions
   ): Promise<AggregateResponse> {
-    let ethersProvider =
-      this.getTypedOptions<MulticallOptionsEthers>().ethersProvider;
-
-    if (!ethersProvider) {
-      const customProvider =
-        this.getTypedOptions<MulticallOptionsCustomJsonRpcProvider>();
-      if (customProvider.nodeUrl) {
-        ethersProvider = new ethers.providers.JsonRpcProvider(
-          customProvider.nodeUrl
-        );
-      } else {
-        ethersProvider = ethers.getDefaultProvider();
-      }
-    }
-
-    const network =
-      this._options.networkId ||
-      (await (
-        await ethersProvider.getNetwork()
-      ).chainId);
+    // Use cached provider for better performance
+    const ethersProvider = await this.getCachedProvider();
+    
+    // Use cached network ID
+    const network = await this.getCachedNetworkId();
 
     const contract = new ethers.Contract(
       this.getContractBasedOnNetwork(network),
@@ -470,6 +581,179 @@ export class Multicall {
       return this.buildUpAggregateResponse(contractResponse, calls);
     }
   }
+  
+  /**
+   * Execute with undici fetch for high-performance HTTP with auto-decompression
+   * @param calls The calls
+   * @param options Call options
+   */
+  private async executeWithUndici(
+    calls: AggregateCallContext[],
+    options: ContractCallOptions
+  ): Promise<AggregateResponse> {
+    const customProvider = this.getTypedOptions<MulticallOptionsCustomJsonRpcProvider>();
+    
+    // Get cached network ID or fetch it
+    const networkId = await this.getCachedNetworkId();
+    const multicallAddress = this.getContractBasedOnNetwork(networkId);
+    
+    // Encode the call data
+    const multicallInterface = this.getMulticallInterface();
+    const mappedCalls = this.mapCallContextToMatchContractFormat(calls);
+    const callData = this._options.tryAggregate
+      ? multicallInterface.encodeFunctionData('tryBlockAndAggregate', [false, mappedCalls])
+      : multicallInterface.encodeFunctionData('aggregate', [mappedCalls]);
+    
+    // Build the JSON-RPC request
+    const blockTag = options.blockNumber 
+      ? `0x${Number(options.blockNumber).toString(16)}` 
+      : 'latest';
+    
+    const payload = {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'eth_call',
+      params: [
+        { to: multicallAddress, data: callData },
+        blockTag,
+      ],
+    };
+    
+    // Make the request using undici fetch with pool dispatcher (auto-decompression)
+    const startTime = Date.now();
+    const response = await fetch(customProvider.nodeUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept-Encoding': 'gzip, deflate',
+      },
+      body: JSON.stringify(payload),
+      dispatcher: this._httpPool,
+    });
+    const fetchDuration = Date.now() - startTime;
+    
+    const contentEncoding = response.headers.get('content-encoding') ?? 'none';
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    
+    // Parse the response (fetch auto-decompresses gzip)
+    const jsonStartTime = Date.now();
+    const responseData = await response.json() as {
+      result?: string;
+      error?: { message: string; code: number };
+    };
+    const jsonDuration = Date.now() - jsonStartTime;
+    
+    console.log(
+      `[multicall] calls=${calls.length} block=${blockTag} compression=${contentEncoding} fetch=${fetchDuration}ms json=${jsonDuration}ms url=${customProvider.nodeUrl}`
+    );
+    
+    if (responseData.error) {
+      throw new Error(`RPC Error: ${responseData.error.message} (code: ${responseData.error.code})`);
+    }
+    
+    if (!responseData.result) {
+      throw new Error('RPC returned empty result');
+    }
+    
+    // Decode the response
+    const methodName = this._options.tryAggregate ? 'tryBlockAndAggregate' : 'aggregate';
+    const decoded = multicallInterface.decodeFunctionResult(methodName, responseData.result);
+    
+    const contractResponse: AggregateContractResponse = {
+      blockNumber: BigNumber.from(decoded.blockNumber),
+      returnData: decoded.returnData,
+    };
+    
+    return this.buildUpAggregateResponse(contractResponse, calls);
+  }
+  
+  /**
+   * Get cached network ID or fetch and cache it
+   */
+  private async getCachedNetworkId(): Promise<number> {
+    if (this._options.networkId) {
+      return this._options.networkId;
+    }
+    
+    if (this._cachedNetworkId) {
+      return this._cachedNetworkId;
+    }
+    
+    // For undici path, we need to fetch network ID via JSON-RPC
+    if (this._options.useUndici && this._httpPool) {
+      const customProvider = this.getTypedOptions<MulticallOptionsCustomJsonRpcProvider>();
+      
+      const payload = {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'eth_chainId',
+        params: [],
+      };
+      
+      // Use fetch with pool dispatcher (auto-decompression)
+      const startTime = Date.now();
+      const response = await fetch(customProvider.nodeUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept-Encoding': 'gzip, deflate',
+        },
+        body: JSON.stringify(payload),
+        dispatcher: this._httpPool,
+      });
+      const fetchDuration = Date.now() - startTime;
+      
+      const contentEncoding = response.headers.get('content-encoding') ?? 'none';
+      
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      
+      const jsonStartTime = Date.now();
+      const responseData = await response.json() as { result: string };
+      const jsonDuration = Date.now() - jsonStartTime;
+      
+      this._cachedNetworkId = parseInt(responseData.result, 16);
+      
+      console.log(
+        `[eth_chainId] networkId=${this._cachedNetworkId} compression=${contentEncoding} fetch=${fetchDuration}ms json=${jsonDuration}ms url=${customProvider.nodeUrl}`
+      );
+      
+      return this._cachedNetworkId;
+    }
+    
+    // Fall back to ethers provider for network ID
+    const provider = await this.getCachedProvider();
+    const network = await provider.getNetwork();
+    this._cachedNetworkId = network.chainId;
+    return this._cachedNetworkId;
+  }
+  
+  /**
+   * Get cached provider or create and cache one
+   */
+  private async getCachedProvider(): Promise<ethers.providers.Provider> {
+    if (this._cachedProvider) {
+      return this._cachedProvider;
+    }
+    
+    let ethersProvider = this.getTypedOptions<MulticallOptionsEthers>().ethersProvider;
+    
+    if (!ethersProvider) {
+      const customProvider = this.getTypedOptions<MulticallOptionsCustomJsonRpcProvider>();
+      if (customProvider.nodeUrl) {
+        ethersProvider = new ethers.providers.JsonRpcProvider(customProvider.nodeUrl);
+      } else {
+        ethersProvider = ethers.getDefaultProvider();
+      }
+    }
+    
+    this._cachedProvider = ethersProvider;
+    return ethersProvider;
+  }
 
   /**
    * Build up the aggregated response from the contract response mapping
@@ -481,34 +765,31 @@ export class Multicall {
     contractResponse: AggregateContractResponse,
     calls: AggregateCallContext[]
   ): AggregateResponse {
-    const aggregateResponse: AggregateResponse = {
-      blockNumber: contractResponse.blockNumber.toNumber(),
-      results: [],
-    };
+    // Use Map for O(1) lookups instead of O(n) .find() in loop
+    const resultMap = new Map<number, AggregateResponse['results'][0]>();
 
     for (let i = 0; i < contractResponse.returnData.length; i++) {
-      const existingResponse = aggregateResponse.results.find(
-        (c) => c.contractContextIndex === calls[i].contractContextIndex
-      );
-      if (existingResponse) {
-        existingResponse.methodResults.push({
-          result: contractResponse.returnData[i],
-          contractMethodIndex: calls[i].contractMethodIndex,
-        });
-      } else {
-        aggregateResponse.results.push({
-          methodResults: [
-            {
-              result: contractResponse.returnData[i],
-              contractMethodIndex: calls[i].contractMethodIndex,
-            },
-          ],
-          contractContextIndex: calls[i].contractContextIndex,
-        });
+      const contextIndex = calls[i].contractContextIndex;
+      let existing = resultMap.get(contextIndex);
+      
+      if (!existing) {
+        existing = {
+          methodResults: [],
+          contractContextIndex: contextIndex,
+        };
+        resultMap.set(contextIndex, existing);
       }
+      
+      existing.methodResults.push({
+        result: contractResponse.returnData[i],
+        contractMethodIndex: calls[i].contractMethodIndex,
+      });
     }
 
-    return aggregateResponse;
+    return {
+      blockNumber: contractResponse.blockNumber.toNumber(),
+      results: Array.from(resultMap.values()),
+    };
   }
 
   /**
