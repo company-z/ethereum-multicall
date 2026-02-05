@@ -242,15 +242,25 @@ export class Multicall {
 
         if (outputTypes && outputTypes.length > 0) {
           try {
-            const decodedReturnValues = defaultAbiCoder.decode(
-              // tslint:disable-next-line: no-any
-              outputTypes as any,
-              this.getReturnDataFromResult(methodContext.result)
-            );
+            // getReturnDataFromResult returns hex bytes string (typed as any[] but actually string)
+            const returnData = this.getReturnDataFromResult(methodContext.result) as unknown as string;
+            
+            // Try fast path for simple types first (avoids expensive ABI decoder)
+            let decodedReturnValues: any[] | null = this.fastDecodeSimpleType(returnData, outputTypes);
+            
+            if (!decodedReturnValues) {
+              // Fall back to full ABI decoder for complex types
+              const decoded = defaultAbiCoder.decode(
+                // tslint:disable-next-line: no-any
+                outputTypes as any,
+                returnData
+              );
+              decodedReturnValues = this.formatReturnValues(decoded);
+            }
 
             // Place result at the correct index (not push) to maintain correspondence with calls array
             returnObjectResult.callsReturnContext[callIndex] = {
-              returnValues: this.formatReturnValues(decodedReturnValues),
+              returnValues: decodedReturnValues,
               decoded: true,
               reference: originalContractCallMethodContext.reference,
               methodName: originalContractCallMethodContext.methodName,
@@ -367,6 +377,86 @@ export class Multicall {
     }
 
     return aggregateCallContext;
+  }
+
+  /**
+   * Fast decode for simple/common return types without full ABI decoder overhead.
+   * Returns null if the type is not supported for fast decoding.
+   * @param returnData The raw hex return data
+   * @param outputTypes The ABI output types
+   */
+  private fastDecodeSimpleType(
+    returnData: string,
+    outputTypes: AbiOutput[]
+  ): any[] | null {
+    // Only handle single output cases for now
+    if (outputTypes.length !== 1) return null;
+    
+    const type = outputTypes[0].type;
+    
+    // uint256/uint128/etc - most common case for balance calls
+    if (type === 'uint256' || type === 'uint128' || type === 'uint64' || 
+        type === 'uint32' || type === 'uint16' || type === 'uint8') {
+      try {
+        // Return BigNumber to match ethers ABI decoder behavior
+        return [BigNumber.from(returnData)];
+      } catch {
+        return null; // Fall back to full decoder on error
+      }
+    }
+    
+    // int256/int128/etc - signed integers
+    if (type === 'int256' || type === 'int128' || type === 'int64' ||
+        type === 'int32' || type === 'int16' || type === 'int8') {
+      try {
+        // For signed integers, we need to handle two's complement
+        // Sign bit threshold and max value for each type
+        const bitWidth: Record<string, number> = {
+          'int256': 256,
+          'int128': 128,
+          'int64': 64,
+          'int32': 32,
+          'int16': 16,
+          'int8': 8,
+        };
+        
+        // Use BigNumber's fromTwos to match ethers ABI decoder behavior
+        const bits = bitWidth[type];
+        const value = BigNumber.from(returnData).mask(bits).fromTwos(bits);
+        return [value];
+      } catch {
+        return null;
+      }
+    }
+    
+    // address type
+    if (type === 'address') {
+      try {
+        // Extract last 40 chars (20 bytes) from the 32-byte word
+        const addr = '0x' + returnData.slice(-40).toLowerCase();
+        return [addr];
+      } catch {
+        return null;
+      }
+    }
+    
+    // bool type
+    if (type === 'bool') {
+      try {
+        // Any non-zero value is true
+        return [returnData !== '0x' + '0'.repeat(64)];
+      } catch {
+        return null;
+      }
+    }
+    
+    // bytes32 type
+    if (type === 'bytes32') {
+      // Return as-is (already 32 bytes hex)
+      return [returnData];
+    }
+    
+    return null; // Fall back to full decoder for other types
   }
 
   /**
