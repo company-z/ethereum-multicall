@@ -204,9 +204,12 @@ export class Multicall {
 
       // Store reference to original context - avoid expensive deep clone of ABI
       // Consumers should treat this as read-only
+      // Pre-allocate callsReturnContext array with correct size to place results by index
+      // This ensures callsReturnContext[idx] corresponds to calls[idx] even when batches
+      // are split/merged or return out of order
       const returnObjectResult: ContractCallReturnContext = {
         originalContractCallContext: originalContractCallContext,
-        callsReturnContext: [],
+        callsReturnContext: new Array(originalContractCallContext.calls.length),
       };
 
       for (
@@ -215,8 +218,9 @@ export class Multicall {
         method++
       ) {
         const methodContext = contractCallsResults.methodResults[method];
+        const callIndex = methodContext.contractMethodIndex;
         const originalContractCallMethodContext =
-          originalContractCallContext.calls[methodContext.contractMethodIndex];
+          originalContractCallContext.calls[callIndex];
 
         const outputTypes = this.findOutputTypesFromAbi(
           originalContractCallContext.abi,
@@ -224,59 +228,69 @@ export class Multicall {
         );
 
         if (this._options.tryAggregate && !methodContext.result.success) {
-          // No need to deepClone - this is a fresh object literal
-          returnObjectResult.callsReturnContext.push({
+          // Place result at the correct index (not push) to maintain correspondence with calls array
+          returnObjectResult.callsReturnContext[callIndex] = {
             returnValues: [methodContext.result.returnData],
             decoded: false,
             reference: originalContractCallMethodContext.reference,
             methodName: originalContractCallMethodContext.methodName,
             methodParameters: originalContractCallMethodContext.methodParameters,
             success: false,
-          });
+          };
           continue;
         }
 
         if (outputTypes && outputTypes.length > 0) {
           try {
-            const decodedReturnValues = defaultAbiCoder.decode(
-              // tslint:disable-next-line: no-any
-              outputTypes as any,
-              this.getReturnDataFromResult(methodContext.result)
-            );
+            // getReturnDataFromResult returns hex bytes string (typed as any[] but actually string)
+            const returnData = this.getReturnDataFromResult(methodContext.result) as unknown as string;
+            
+            // Try fast path for simple types first (avoids expensive ABI decoder)
+            let decodedReturnValues: any[] | null = this.fastDecodeSimpleType(returnData, outputTypes);
+            
+            if (!decodedReturnValues) {
+              // Fall back to full ABI decoder for complex types
+              const decoded = defaultAbiCoder.decode(
+                // tslint:disable-next-line: no-any
+                outputTypes as any,
+                returnData
+              );
+              decodedReturnValues = this.formatReturnValues(decoded);
+            }
 
-            // No need to deepClone - this is a fresh object literal
-            returnObjectResult.callsReturnContext.push({
-              returnValues: this.formatReturnValues(decodedReturnValues),
+            // Place result at the correct index (not push) to maintain correspondence with calls array
+            returnObjectResult.callsReturnContext[callIndex] = {
+              returnValues: decodedReturnValues,
               decoded: true,
               reference: originalContractCallMethodContext.reference,
               methodName: originalContractCallMethodContext.methodName,
               methodParameters: originalContractCallMethodContext.methodParameters,
               success: true,
-            });
+            };
           } catch (e) {
             if (!this._options.tryAggregate) {
               throw e;
             }
-            // No need to deepClone - this is a fresh object literal
-            returnObjectResult.callsReturnContext.push({
+            // Place result at the correct index (not push) to maintain correspondence with calls array
+            returnObjectResult.callsReturnContext[callIndex] = {
               returnValues: [],
               decoded: false,
               reference: originalContractCallMethodContext.reference,
               methodName: originalContractCallMethodContext.methodName,
               methodParameters: originalContractCallMethodContext.methodParameters,
               success: false,
-            });
+            };
           }
         } else {
-          // No need to deepClone - this is a fresh object literal
-          returnObjectResult.callsReturnContext.push({
+          // Place result at the correct index (not push) to maintain correspondence with calls array
+          returnObjectResult.callsReturnContext[callIndex] = {
             returnValues: this.getReturnDataFromResult(methodContext.result),
             decoded: false,
             reference: originalContractCallMethodContext.reference,
             methodName: originalContractCallMethodContext.methodName,
             methodParameters: originalContractCallMethodContext.methodParameters,
             success: true,
-          });
+          };
         }
       }
 
@@ -303,6 +317,8 @@ export class Multicall {
 
   /**
    * Format return values so its always an array
+   * Converts BigNumber to decimal strings for consistency with fast path
+   * Preserves named properties from ethers Result objects for struct/tuple access
    * @param decodedReturnValues The decoded return values
    */
   // tslint:disable-next-line: no-any
@@ -313,10 +329,58 @@ export class Multicall {
     }
 
     if (Array.isArray(decodedReturnResults)) {
-      return decodedReturnResults;
+      // Normalize values while preserving named properties from ethers Result objects
+      const normalized: any[] = [];
+      for (let i = 0; i < decodedReturnResults.length; i++) {
+        normalized[i] = this.normalizeValue(decodedReturnResults[i]);
+      }
+      // Copy named properties (struct field names) from ethers Result
+      // These are non-numeric string keys that provide named access to tuple elements
+      for (const key of Object.keys(decodedReturnResults)) {
+        if (isNaN(Number(key))) {
+          (normalized as Record<string, any>)[key] = this.normalizeValue(
+            (decodedReturnResults as Record<string, any>)[key]
+          );
+        }
+      }
+      return normalized;
     }
 
-    return [decodedReturnResults];
+    return [this.normalizeValue(decodedReturnResults)];
+  }
+  
+  /**
+   * Normalize a decoded value to match fast path return types
+   * Converts BigNumber to decimal string, leaves other types unchanged
+   * Preserves named properties from ethers Result objects for nested struct/tuple access
+   * @param value The value to normalize
+   */
+  // tslint:disable-next-line: no-any
+  private normalizeValue(value: any): any {
+    // Convert BigNumber to decimal string
+    if (BigNumber.isBigNumber(value)) {
+      return value.toString();
+    }
+    
+    // Recursively handle arrays (for tuple returns), preserving named properties
+    if (Array.isArray(value)) {
+      const normalized: any[] = [];
+      for (let i = 0; i < value.length; i++) {
+        normalized[i] = this.normalizeValue(value[i]);
+      }
+      // Copy named properties (struct field names) from ethers Result
+      for (const key of Object.keys(value)) {
+        if (isNaN(Number(key))) {
+          (normalized as Record<string, any>)[key] = this.normalizeValue(
+            (value as Record<string, any>)[key]
+          );
+        }
+      }
+      return normalized;
+    }
+    
+    // Leave other types unchanged (string, boolean, bytes)
+    return value;
   }
 
   /**
@@ -363,6 +427,92 @@ export class Multicall {
     }
 
     return aggregateCallContext;
+  }
+
+  /**
+   * Fast decode for simple/common return types without full ABI decoder overhead.
+   * Returns null if the type is not supported for fast decoding.
+   * @param returnData The raw hex return data
+   * @param outputTypes The ABI output types
+   */
+  private fastDecodeSimpleType(
+    returnData: string,
+    outputTypes: AbiOutput[]
+  ): any[] | null {
+    // Only handle single output cases for now
+    if (outputTypes.length !== 1) return null;
+    
+    const type = outputTypes[0].type;
+    
+    // uint256/uint128/etc - most common case for balance calls
+    // Returns decimal string for maximum performance (avoids BigNumber overhead)
+    if (type === 'uint256' || type === 'uint128' || type === 'uint64' || 
+        type === 'uint32' || type === 'uint16' || type === 'uint8') {
+      try {
+        return [BigInt(returnData).toString(10)];
+      } catch {
+        return null; // Fall back to full decoder on error
+      }
+    }
+    
+    // int256/int128/etc - signed integers
+    // Returns decimal string for maximum performance (avoids BigNumber overhead)
+    if (type === 'int256' || type === 'int128' || type === 'int64' ||
+        type === 'int32' || type === 'int16' || type === 'int8') {
+      try {
+        // Sign bit threshold and max value for each type
+        const signedBitInfo: Record<string, { signBit: bigint; maxVal: bigint }> = {
+          'int256': { signBit: 1n << 255n, maxVal: 1n << 256n },
+          'int128': { signBit: 1n << 127n, maxVal: 1n << 128n },
+          'int64':  { signBit: 1n << 63n,  maxVal: 1n << 64n },
+          'int32':  { signBit: 1n << 31n,  maxVal: 1n << 32n },
+          'int16':  { signBit: 1n << 15n,  maxVal: 1n << 16n },
+          'int8':   { signBit: 1n << 7n,   maxVal: 1n << 8n },
+        };
+        
+        const bn = BigInt(returnData);
+        const { signBit, maxVal } = signedBitInfo[type];
+        
+        // Mask to the correct bit width, then check sign bit
+        const masked = bn & (maxVal - 1n);
+        if (masked >= signBit) {
+          // Negative number in two's complement
+          return [(masked - maxVal).toString(10)];
+        }
+        return [masked.toString(10)];
+      } catch {
+        return null;
+      }
+    }
+    
+    // address type
+    if (type === 'address') {
+      try {
+        // Extract last 40 chars (20 bytes) and checksum to match ABI decoder
+        const addr = ethers.utils.getAddress('0x' + returnData.slice(-40));
+        return [addr];
+      } catch {
+        return null;
+      }
+    }
+    
+    // bool type
+    if (type === 'bool') {
+      try {
+        // Any non-zero value is true
+        return [returnData !== '0x' + '0'.repeat(64)];
+      } catch {
+        return null;
+      }
+    }
+    
+    // bytes32 type
+    if (type === 'bytes32') {
+      // Return as-is (already 32 bytes hex)
+      return [returnData];
+    }
+    
+    return null; // Fall back to full decoder for other types
   }
 
   /**
