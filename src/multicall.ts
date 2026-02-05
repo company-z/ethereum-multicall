@@ -204,9 +204,12 @@ export class Multicall {
 
       // Store reference to original context - avoid expensive deep clone of ABI
       // Consumers should treat this as read-only
+      // Pre-allocate callsReturnContext array with correct size to place results by index
+      // This ensures callsReturnContext[idx] corresponds to calls[idx] even when batches
+      // are split/merged or return out of order
       const returnObjectResult: ContractCallReturnContext = {
         originalContractCallContext: originalContractCallContext,
-        callsReturnContext: [],
+        callsReturnContext: new Array(originalContractCallContext.calls.length),
       };
 
       for (
@@ -215,8 +218,9 @@ export class Multicall {
         method++
       ) {
         const methodContext = contractCallsResults.methodResults[method];
+        const callIndex = methodContext.contractMethodIndex;
         const originalContractCallMethodContext =
-          originalContractCallContext.calls[methodContext.contractMethodIndex];
+          originalContractCallContext.calls[callIndex];
 
         const outputTypes = this.findOutputTypesFromAbi(
           originalContractCallContext.abi,
@@ -224,15 +228,15 @@ export class Multicall {
         );
 
         if (this._options.tryAggregate && !methodContext.result.success) {
-          // No need to deepClone - this is a fresh object literal
-          returnObjectResult.callsReturnContext.push({
+          // Place result at the correct index (not push) to maintain correspondence with calls array
+          returnObjectResult.callsReturnContext[callIndex] = {
             returnValues: [methodContext.result.returnData],
             decoded: false,
             reference: originalContractCallMethodContext.reference,
             methodName: originalContractCallMethodContext.methodName,
             methodParameters: originalContractCallMethodContext.methodParameters,
             success: false,
-          });
+          };
           continue;
         }
 
@@ -244,39 +248,39 @@ export class Multicall {
               this.getReturnDataFromResult(methodContext.result)
             );
 
-            // No need to deepClone - this is a fresh object literal
-            returnObjectResult.callsReturnContext.push({
+            // Place result at the correct index (not push) to maintain correspondence with calls array
+            returnObjectResult.callsReturnContext[callIndex] = {
               returnValues: this.formatReturnValues(decodedReturnValues),
               decoded: true,
               reference: originalContractCallMethodContext.reference,
               methodName: originalContractCallMethodContext.methodName,
               methodParameters: originalContractCallMethodContext.methodParameters,
               success: true,
-            });
+            };
           } catch (e) {
             if (!this._options.tryAggregate) {
               throw e;
             }
-            // No need to deepClone - this is a fresh object literal
-            returnObjectResult.callsReturnContext.push({
+            // Place result at the correct index (not push) to maintain correspondence with calls array
+            returnObjectResult.callsReturnContext[callIndex] = {
               returnValues: [],
               decoded: false,
               reference: originalContractCallMethodContext.reference,
               methodName: originalContractCallMethodContext.methodName,
               methodParameters: originalContractCallMethodContext.methodParameters,
               success: false,
-            });
+            };
           }
         } else {
-          // No need to deepClone - this is a fresh object literal
-          returnObjectResult.callsReturnContext.push({
+          // Place result at the correct index (not push) to maintain correspondence with calls array
+          returnObjectResult.callsReturnContext[callIndex] = {
             returnValues: this.getReturnDataFromResult(methodContext.result),
             decoded: false,
             reference: originalContractCallMethodContext.reference,
             methodName: originalContractCallMethodContext.methodName,
             methodParameters: originalContractCallMethodContext.methodParameters,
             success: true,
-          });
+          };
         }
       }
 
