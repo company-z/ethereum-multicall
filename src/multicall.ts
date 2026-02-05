@@ -980,96 +980,110 @@ export class Multicall {
 
   /**
    * Fast decode for tryBlockAndAggregate response without full ABI decoder.
-   * Manually parses the ABI-encoded response for maximum performance.
+   * Uses Buffer for high-performance binary parsing instead of string operations.
    * 
    * Response format for tryBlockAndAggregate(false, calls[]):
    * - bytes32: blockNumber (slot 0)
    * - bytes32: blockHash (slot 1)
    * - offset to results array (slot 2)
    * - At that offset: array length
-   * - Then: offsets to each Result tuple (relative to array start)
+   * - Then: offsets to each Result tuple (relative to position after length)
    * - Then: Result tuples, each containing {success: bool, returnData: bytes}
    */
   private fastDecodeTryBlockAndAggregate(
     data: string
   ): AggregateContractResponse | null {
     try {
-      // Remove 0x prefix if present
-      const hex = data.startsWith('0x') ? data.slice(2) : data;
+      // Convert hex string to Buffer ONCE - this is the only major allocation
+      const hexStr = data.startsWith('0x') ? data.slice(2) : data;
+      const buf = Buffer.from(hexStr, 'hex');
       
-      // Each slot is 32 bytes = 64 hex chars
-      const SLOT = 64;
+      const SLOT = 32; // 32 bytes per slot
       
       // Validate minimum length (at least 3 slots for header)
-      if (hex.length < SLOT * 3) {
-        this.logFastDecodeFailure('hex_too_short', { hexLength: hex.length, minRequired: SLOT * 3 });
+      if (buf.length < SLOT * 3) {
+        this.logFastDecodeFailure('hex_too_short', { bufLength: buf.length, minRequired: SLOT * 3 });
         return null;
       }
       
-      // blockNumber is first 32 bytes
-      const blockNumber = BigNumber.from('0x' + hex.slice(0, SLOT));
+      // Read blockNumber directly from buffer (first 32 bytes)
+      const blockNumber = BigNumber.from(buf.subarray(0, SLOT));
       
       // blockHash is next 32 bytes (slot 1) - we don't need it
       
-      // Slot 2: offset to results array (in bytes, relative to start)
-      // Read actual offset instead of assuming 96
-      const arrayOffsetBytes = parseInt(hex.slice(SLOT * 2, SLOT * 3), 16);
-      const arrayDataStart = arrayOffsetBytes * 2; // Convert bytes to hex chars
+      // Slot 2: offset to results array (read last 4 bytes of slot - offsets fit in uint32)
+      const arrayOffsetBytes = buf.readUInt32BE(SLOT * 2 + 28);
       
       // Validate offset is reasonable
-      if (arrayDataStart < SLOT * 3 || arrayDataStart >= hex.length) {
+      if (arrayOffsetBytes < SLOT * 3 || arrayOffsetBytes >= buf.length) {
         this.logFastDecodeFailure('invalid_array_offset', { 
           arrayOffsetBytes, 
-          arrayDataStart, 
-          hexLength: hex.length,
+          bufLength: buf.length,
           minExpected: SLOT * 3,
         });
         return null;
       }
       
-      // First value at array data is the array length
-      const arrayLength = parseInt(hex.slice(arrayDataStart, arrayDataStart + SLOT), 16);
+      // Array length (last 4 bytes of the length slot)
+      const arrayLength = buf.readUInt32BE(arrayOffsetBytes + 28);
       
       // Sanity check array length
-      if (arrayLength > 10000 || arrayLength < 0 || isNaN(arrayLength)) {
+      if (arrayLength > 10000 || arrayLength < 0) {
         this.logFastDecodeFailure('invalid_array_length', { arrayLength });
         return null;
       }
       
-      // After length comes `arrayLength` offsets, each pointing to a Result tuple
-      // These offsets are relative to the start of the array data
-      const offsetsStart = arrayDataStart + SLOT;
+      // offsetsStart is right after the array length (where ethers anchors baseReader)
+      const offsetsStart = arrayOffsetBytes + SLOT;
+      
+      // Debug: Log structure analysis
+      if (this._enableTimingLogs) {
+        const expectedFirstTupleBytePos = arrayOffsetBytes + SLOT + (arrayLength * SLOT);
+        const firstOffsetValue = buf.readUInt32BE(offsetsStart + 28);
+        
+        console.log('[multicall] fastDecode structure analysis:', {
+          arrayOffsetBytes,
+          arrayLength,
+          offsetsStart,
+          firstOffsetValue,
+          expectedFirstTupleBytePos,
+          calculatedFirstTupleBytePos: offsetsStart + firstOffsetValue,
+          bufLength: buf.length,
+        });
+      }
       
       // Use any[] to match the loose typing used elsewhere for returnData
       const returnData: any[] = new Array(arrayLength);
       
       for (let i = 0; i < arrayLength; i++) {
-        // Get offset for this result tuple (relative to array data start)
+        // Get offset for this result tuple
         const offsetPos = offsetsStart + (i * SLOT);
         
         // Validate we have enough data
-        if (offsetPos + SLOT > hex.length) {
+        if (offsetPos + SLOT > buf.length) {
           this.logFastDecodeFailure('offset_pos_overflow', { 
             index: i, 
             offsetPos, 
-            hexLength: hex.length,
+            bufLength: buf.length,
             arrayLength,
           });
           return null;
         }
         
-        const tupleOffsetFromArrayStart = parseInt(hex.slice(offsetPos, offsetPos + SLOT), 16);
+        // Read tuple offset (last 4 bytes of slot - offsets fit in uint32)
+        const tupleOffset = buf.readUInt32BE(offsetPos + 28);
         
-        // Tuple position in hex string: arrayDataStart + (tupleOffsetFromArrayStart * 2)
-        const tupleStart = arrayDataStart + (tupleOffsetFromArrayStart * 2);
+        // Tuple position: offsetsStart + tupleOffset
+        // (offsets are relative to position after array length, where ethers anchors baseReader)
+        const tupleStart = offsetsStart + tupleOffset;
         
         // Validate tuple position
-        if (tupleStart + SLOT * 2 > hex.length) {
+        if (tupleStart + SLOT * 2 > buf.length) {
           this.logFastDecodeFailure('tuple_pos_overflow', { 
             index: i, 
             tupleStart, 
-            tupleOffsetFromArrayStart,
-            hexLength: hex.length,
+            tupleOffset,
+            bufLength: buf.length,
           });
           return null;
         }
@@ -1079,53 +1093,53 @@ export class Multicall {
         // - slot 1: offset to returnData bytes (relative to tuple start)
         // - at that offset: length of bytes, then the bytes data
         
-        // success: any non-zero value is true
-        const successSlot = hex.slice(tupleStart, tupleStart + SLOT);
-        const success = successSlot !== '0'.repeat(64);
+        // Success: check if any byte in the slot is non-zero (fast path: check last byte first)
+        let success = buf[tupleStart + 31] !== 0;
+        if (!success) {
+          // Full check only if last byte was zero
+          for (let j = tupleStart; j < tupleStart + 31; j++) {
+            if (buf[j] !== 0) {
+              success = true;
+              break;
+            }
+          }
+        }
         
-        // Offset to returnData (relative to tuple start, in bytes)
-        const returnDataOffsetBytes = parseInt(hex.slice(tupleStart + SLOT, tupleStart + SLOT * 2), 16);
-        
-        // returnData position: tupleStart + (returnDataOffsetBytes * 2)
-        const returnDataStart = tupleStart + (returnDataOffsetBytes * 2);
+        // ReturnData offset (last 4 bytes of slot)
+        const returnDataOffset = buf.readUInt32BE(tupleStart + SLOT + 28);
+        const returnDataStart = tupleStart + returnDataOffset;
         
         // Validate returnData position
-        if (returnDataStart + SLOT > hex.length) {
+        if (returnDataStart + SLOT > buf.length) {
           this.logFastDecodeFailure('returndata_pos_overflow', { 
             index: i, 
             returnDataStart, 
-            returnDataOffsetBytes,
+            returnDataOffset,
             tupleStart,
-            hexLength: hex.length,
+            bufLength: buf.length,
           });
           return null;
         }
         
-        // First 32 bytes at returnData position: length of the bytes
-        const returnDataLength = parseInt(hex.slice(returnDataStart, returnDataStart + SLOT), 16);
+        // ReturnData length (last 4 bytes of length slot)
+        const returnDataLength = buf.readUInt32BE(returnDataStart + 28);
         
-        // Validate return data doesn't exceed hex length
-        if (returnDataStart + SLOT + (returnDataLength * 2) > hex.length) {
+        // Validate return data doesn't exceed buffer length
+        if (returnDataStart + SLOT + returnDataLength > buf.length) {
           this.logFastDecodeFailure('returndata_length_overflow', { 
             index: i, 
             returnDataStart, 
             returnDataLength,
-            needed: returnDataStart + SLOT + (returnDataLength * 2),
-            hexLength: hex.length,
+            needed: returnDataStart + SLOT + returnDataLength,
+            bufLength: buf.length,
           });
           return null;
         }
         
-        // Actual bytes follow the length (returnDataLength bytes = returnDataLength * 2 hex chars)
-        let returnDataHex: string;
-        if (returnDataLength === 0) {
-          returnDataHex = '0x';
-        } else {
-          returnDataHex = '0x' + hex.slice(
-            returnDataStart + SLOT,
-            returnDataStart + SLOT + (returnDataLength * 2)
-          );
-        }
+        // Extract returnData as hex string - subarray is zero-copy!
+        const returnDataHex = returnDataLength === 0
+          ? '0x'
+          : '0x' + buf.subarray(returnDataStart + SLOT, returnDataStart + SLOT + returnDataLength).toString('hex');
         
         returnData[i] = { success, returnData: returnDataHex };
       }
