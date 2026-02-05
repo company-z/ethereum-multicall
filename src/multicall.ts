@@ -318,6 +318,7 @@ export class Multicall {
   /**
    * Format return values so its always an array
    * Converts BigNumber to decimal strings for consistency with fast path
+   * Preserves named properties from ethers Result objects for struct/tuple access
    * @param decodedReturnValues The decoded return values
    */
   // tslint:disable-next-line: no-any
@@ -328,7 +329,21 @@ export class Multicall {
     }
 
     if (Array.isArray(decodedReturnResults)) {
-      return decodedReturnResults.map((val: any) => this.normalizeValue(val));
+      // Normalize values while preserving named properties from ethers Result objects
+      const normalized: any[] = [];
+      for (let i = 0; i < decodedReturnResults.length; i++) {
+        normalized[i] = this.normalizeValue(decodedReturnResults[i]);
+      }
+      // Copy named properties (struct field names) from ethers Result
+      // These are non-numeric string keys that provide named access to tuple elements
+      for (const key of Object.keys(decodedReturnResults)) {
+        if (isNaN(Number(key))) {
+          (normalized as Record<string, any>)[key] = this.normalizeValue(
+            (decodedReturnResults as Record<string, any>)[key]
+          );
+        }
+      }
+      return normalized;
     }
 
     return [this.normalizeValue(decodedReturnResults)];
@@ -337,6 +352,7 @@ export class Multicall {
   /**
    * Normalize a decoded value to match fast path return types
    * Converts BigNumber to decimal string, leaves other types unchanged
+   * Preserves named properties from ethers Result objects for nested struct/tuple access
    * @param value The value to normalize
    */
   // tslint:disable-next-line: no-any
@@ -346,9 +362,21 @@ export class Multicall {
       return value.toString();
     }
     
-    // Recursively handle arrays (for tuple returns)
+    // Recursively handle arrays (for tuple returns), preserving named properties
     if (Array.isArray(value)) {
-      return value.map((v: any) => this.normalizeValue(v));
+      const normalized: any[] = [];
+      for (let i = 0; i < value.length; i++) {
+        normalized[i] = this.normalizeValue(value[i]);
+      }
+      // Copy named properties (struct field names) from ethers Result
+      for (const key of Object.keys(value)) {
+        if (isNaN(Number(key))) {
+          (normalized as Record<string, any>)[key] = this.normalizeValue(
+            (value as Record<string, any>)[key]
+          );
+        }
+      }
+      return normalized;
     }
     
     // Leave other types unchanged (string, boolean, bytes)
