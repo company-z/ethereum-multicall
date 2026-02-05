@@ -843,16 +843,118 @@ export class Multicall {
       throw new Error('RPC returned empty result');
     }
     
-    // Decode the response
-    const methodName = this._options.tryAggregate ? 'tryBlockAndAggregate' : 'aggregate';
-    const decoded = multicallInterface.decodeFunctionResult(methodName, responseData.result);
+    // Decode the response - use fast path for tryBlockAndAggregate
+    let contractResponse: AggregateContractResponse;
     
-    const contractResponse: AggregateContractResponse = {
-      blockNumber: BigNumber.from(decoded.blockNumber),
-      returnData: decoded.returnData,
-    };
+    if (this._options.tryAggregate) {
+      // Try fast decode first (avoids expensive ABI decoder for large responses)
+      const fastDecoded = this.fastDecodeTryBlockAndAggregate(responseData.result);
+      if (fastDecoded) {
+        contractResponse = fastDecoded;
+      } else {
+        // Fall back to full decoder on error
+        const decoded = multicallInterface.decodeFunctionResult('tryBlockAndAggregate', responseData.result);
+        contractResponse = {
+          blockNumber: BigNumber.from(decoded.blockNumber),
+          returnData: decoded.returnData,
+        };
+      }
+    } else {
+      const decoded = multicallInterface.decodeFunctionResult('aggregate', responseData.result);
+      contractResponse = {
+        blockNumber: BigNumber.from(decoded.blockNumber),
+        returnData: decoded.returnData,
+      };
+    }
     
     return this.buildUpAggregateResponse(contractResponse, calls);
+  }
+
+  /**
+   * Fast decode for tryBlockAndAggregate response without full ABI decoder.
+   * Manually parses the ABI-encoded response for maximum performance.
+   * 
+   * Response format for tryBlockAndAggregate(false, calls[]):
+   * - bytes32: blockNumber (slot 0)
+   * - bytes32: blockHash (slot 1)
+   * - offset to results array (slot 2, always 0x60 = 96)
+   * - At offset 96: array length
+   * - Then: offsets to each Result tuple (relative to array start)
+   * - Then: Result tuples, each containing {success: bool, returnData: bytes}
+   */
+  private fastDecodeTryBlockAndAggregate(
+    data: string
+  ): AggregateContractResponse | null {
+    try {
+      // Remove 0x prefix if present
+      const hex = data.startsWith('0x') ? data.slice(2) : data;
+      
+      // Each slot is 32 bytes = 64 hex chars
+      const SLOT = 64;
+      
+      // blockNumber is first 32 bytes
+      const blockNumber = BigNumber.from('0x' + hex.slice(0, SLOT));
+      
+      // blockHash is next 32 bytes (slot 1) - we don't need it
+      // Offset to results array is at slot 2 (always 0x60 = 96 bytes from start)
+      
+      // Array data starts at byte offset 96 (hex position 192)
+      // First value at array start is the array length
+      const arrayDataStart = 192; // 96 bytes * 2 hex chars
+      const arrayLength = parseInt(hex.slice(arrayDataStart, arrayDataStart + SLOT), 16);
+      
+      // After length comes `arrayLength` offsets, each pointing to a Result tuple
+      // These offsets are relative to the start of the array data (byte 96)
+      const offsetsStart = arrayDataStart + SLOT;
+      
+      // Use any[] to match the loose typing used elsewhere for returnData
+      const returnData: any[] = new Array(arrayLength);
+      
+      for (let i = 0; i < arrayLength; i++) {
+        // Get offset for this result tuple (relative to array data start at byte 96)
+        const offsetPos = offsetsStart + (i * SLOT);
+        const tupleOffsetFromArrayStart = parseInt(hex.slice(offsetPos, offsetPos + SLOT), 16);
+        
+        // Tuple position in hex string: arrayDataStart + (tupleOffsetFromArrayStart * 2)
+        const tupleStart = arrayDataStart + (tupleOffsetFromArrayStart * 2);
+        
+        // Result tuple structure:
+        // - slot 0: success (bool, right-padded in 32 bytes)
+        // - slot 1: offset to returnData bytes (relative to tuple start)
+        // - at that offset: length of bytes, then the bytes data
+        
+        // success: any non-zero value is true
+        const successSlot = hex.slice(tupleStart, tupleStart + SLOT);
+        const success = successSlot !== '0'.repeat(64);
+        
+        // Offset to returnData (relative to tuple start, in bytes)
+        const returnDataOffsetBytes = parseInt(hex.slice(tupleStart + SLOT, tupleStart + SLOT * 2), 16);
+        
+        // returnData position: tupleStart + (returnDataOffsetBytes * 2)
+        const returnDataStart = tupleStart + (returnDataOffsetBytes * 2);
+        
+        // First 32 bytes at returnData position: length of the bytes
+        const returnDataLength = parseInt(hex.slice(returnDataStart, returnDataStart + SLOT), 16);
+        
+        // Actual bytes follow the length (returnDataLength bytes = returnDataLength * 2 hex chars)
+        let returnDataHex: string;
+        if (returnDataLength === 0) {
+          returnDataHex = '0x';
+        } else {
+          returnDataHex = '0x' + hex.slice(
+            returnDataStart + SLOT,
+            returnDataStart + SLOT + (returnDataLength * 2)
+          );
+        }
+        
+        returnData[i] = { success, returnData: returnDataHex };
+      }
+      
+      return { blockNumber, returnData };
+    } catch {
+      // Fall back to full decoder on any error
+      return null;
+    }
   }
   
   /**
