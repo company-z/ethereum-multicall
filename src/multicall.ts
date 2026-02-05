@@ -16,6 +16,7 @@ import {
   MulticallOptionsEthers,
   MulticallOptionsWeb3,
   ContractCallOptions,
+  TimingLogger,
 } from './models';
 
 export class Multicall {
@@ -110,6 +111,16 @@ export class Multicall {
   private _abiInterfaceCache = new LRUCache<string, ethers.utils.Interface>({ max: 1000 });
   // Cache for output types to avoid repeated ABI lookups (wrapped to allow undefined)
   private _outputTypesCache = new LRUCache<string, { outputs: AbiOutput[] | undefined }>({ max: 5000 });
+  
+  // Timing infrastructure
+  private _enableTimingLogs = false;
+  private _timingLogger: TimingLogger = (message, meta) => {
+    if (meta) {
+      console.log(`[multicall-timing] ${message}`, meta);
+    } else {
+      console.log(`[multicall-timing] ${message}`);
+    }
+  };
 
   constructor(
     private _options:
@@ -117,6 +128,14 @@ export class Multicall {
       | MulticallOptionsEthers
       | MulticallOptionsCustomJsonRpcProvider
   ) {
+    // Configure timing options (do this first as it applies to all execution types)
+    if (this._options.enableTimingLogs !== undefined) {
+      this._enableTimingLogs = this._options.enableTimingLogs;
+    }
+    if (this._options.timingLogger !== undefined) {
+      this._timingLogger = this._options.timingLogger;
+    }
+    
     if ((this._options as MulticallOptionsWeb3).web3Instance) {
       this._executionType = ExecutionType.web3;
       return;
@@ -152,6 +171,22 @@ export class Multicall {
   }
   
   /**
+   * Log timing information if timing logs are enabled.
+   */
+  private logTiming(
+    phase: string,
+    durationMs: number,
+    meta?: Record<string, unknown>
+  ): void {
+    if (!this._enableTimingLogs) return;
+    this._timingLogger(`${phase}: ${durationMs.toFixed(2)}ms`, {
+      phase,
+      durationMs,
+      ...meta,
+    });
+  }
+  
+  /**
    * Close the HTTP pool connection (call when done with multicall instance)
    */
   public async close(): Promise<void> {
@@ -179,20 +214,46 @@ export class Multicall {
     contractCallContexts: ContractCallContext[] | ContractCallContext,
     contractCallOptions: ContractCallOptions = {}
   ): Promise<ContractCallResults> {
+    const callStartTime = Date.now();
+    
     if (!Array.isArray(contractCallContexts)) {
       contractCallContexts = [contractCallContexts];
     }
+    
+    const totalCalls = contractCallContexts.reduce(
+      (sum, ctx) => sum + ctx.calls.length,
+      0
+    );
 
+    // Phase 1: Build aggregate call context (encoding)
+    const encodeStartTime = Date.now();
+    const aggregateCallContext = this.buildAggregateCallContext(contractCallContexts);
+    this.logTiming('buildAggregateCallContext', Date.now() - encodeStartTime, {
+      contractCount: contractCallContexts.length,
+      totalCalls,
+    });
+    
+    // Phase 2: Execute the multicall (network request)
+    const executeStartTime = Date.now();
     const aggregateResponse = await this.execute(
-      this.buildAggregateCallContext(contractCallContexts),
+      aggregateCallContext,
       contractCallOptions
     );
+    this.logTiming('execute', Date.now() - executeStartTime, {
+      totalCalls,
+    });
 
     const returnObject: ContractCallResults = {
       results: {},
       blockNumber: aggregateResponse.blockNumber,
     };
 
+    // Phase 3: Decode and format results
+    const decodeStartTime = Date.now();
+    let decodeCount = 0;
+    let fastDecodeCount = 0;
+    let fullDecodeCount = 0;
+    
     for (
       let response = 0;
       response < aggregateResponse.results.length;
@@ -248,7 +309,9 @@ export class Multicall {
             // Try fast path for simple types first (avoids expensive ABI decoder)
             let decodedReturnValues: any[] | null = this.fastDecodeSimpleType(returnData, outputTypes);
             
-            if (!decodedReturnValues) {
+            if (decodedReturnValues) {
+              fastDecodeCount++;
+            } else {
               // Fall back to full ABI decoder for complex types
               const decoded = defaultAbiCoder.decode(
                 // tslint:disable-next-line: no-any
@@ -256,7 +319,9 @@ export class Multicall {
                 returnData
               );
               decodedReturnValues = this.formatReturnValues(decoded);
+              fullDecodeCount++;
             }
+            decodeCount++;
 
             // Place result at the correct index (not push) to maintain correspondence with calls array
             returnObjectResult.callsReturnContext[callIndex] = {
@@ -298,6 +363,18 @@ export class Multicall {
         returnObjectResult.originalContractCallContext.reference
       ] = returnObjectResult;
     }
+    
+    this.logTiming('decodeResults', Date.now() - decodeStartTime, {
+      decodeCount,
+      fastDecodeCount,
+      fullDecodeCount,
+    });
+    
+    this.logTiming('call:total', Date.now() - callStartTime, {
+      contractCount: contractCallContexts.length,
+      totalCalls,
+      blockNumber: aggregateResponse.blockNumber,
+    });
 
     return returnObject;
   }
@@ -844,28 +921,59 @@ export class Multicall {
     }
     
     // Decode the response - use fast path for tryBlockAndAggregate
+    const decodeStartTime = Date.now();
     let contractResponse: AggregateContractResponse;
+    let usedFastDecode = false;
     
     if (this._options.tryAggregate) {
       // Try fast decode first (avoids expensive ABI decoder for large responses)
+      const fastDecodeStartTime = Date.now();
       const fastDecoded = this.fastDecodeTryBlockAndAggregate(responseData.result);
+      const fastDecodeDuration = Date.now() - fastDecodeStartTime;
+      
       if (fastDecoded) {
         contractResponse = fastDecoded;
+        usedFastDecode = true;
+        this.logTiming('undici:fastDecode', fastDecodeDuration, {
+          success: true,
+          resultLength: responseData.result.length,
+          callCount: fastDecoded.returnData.length,
+        });
       } else {
         // Fall back to full decoder on error
+        this.logTiming('undici:fastDecode', fastDecodeDuration, {
+          success: false,
+          resultLength: responseData.result.length,
+        });
+        
+        const ethersDecodeStartTime = Date.now();
         const decoded = multicallInterface.decodeFunctionResult('tryBlockAndAggregate', responseData.result);
         contractResponse = {
           blockNumber: BigNumber.from(decoded.blockNumber),
           returnData: decoded.returnData,
         };
+        this.logTiming('undici:ethersDecode:tryBlockAndAggregate', Date.now() - ethersDecodeStartTime, {
+          callCount: decoded.returnData.length,
+          resultLength: responseData.result.length,
+        });
       }
     } else {
+      const ethersDecodeStartTime = Date.now();
       const decoded = multicallInterface.decodeFunctionResult('aggregate', responseData.result);
       contractResponse = {
         blockNumber: BigNumber.from(decoded.blockNumber),
         returnData: decoded.returnData,
       };
+      this.logTiming('undici:ethersDecode:aggregate', Date.now() - ethersDecodeStartTime, {
+        callCount: decoded.returnData.length,
+        resultLength: responseData.result.length,
+      });
     }
+    
+    this.logTiming('undici:decode:total', Date.now() - decodeStartTime, {
+      usedFastDecode,
+      callCount: contractResponse.returnData.length,
+    });
     
     return this.buildUpAggregateResponse(contractResponse, calls);
   }
@@ -894,6 +1002,7 @@ export class Multicall {
       
       // Validate minimum length (at least 3 slots for header)
       if (hex.length < SLOT * 3) {
+        this.logFastDecodeFailure('hex_too_short', { hexLength: hex.length, minRequired: SLOT * 3 });
         return null;
       }
       
@@ -909,6 +1018,12 @@ export class Multicall {
       
       // Validate offset is reasonable
       if (arrayDataStart < SLOT * 3 || arrayDataStart >= hex.length) {
+        this.logFastDecodeFailure('invalid_array_offset', { 
+          arrayOffsetBytes, 
+          arrayDataStart, 
+          hexLength: hex.length,
+          minExpected: SLOT * 3,
+        });
         return null;
       }
       
@@ -917,6 +1032,7 @@ export class Multicall {
       
       // Sanity check array length
       if (arrayLength > 10000 || arrayLength < 0 || isNaN(arrayLength)) {
+        this.logFastDecodeFailure('invalid_array_length', { arrayLength });
         return null;
       }
       
@@ -933,6 +1049,12 @@ export class Multicall {
         
         // Validate we have enough data
         if (offsetPos + SLOT > hex.length) {
+          this.logFastDecodeFailure('offset_pos_overflow', { 
+            index: i, 
+            offsetPos, 
+            hexLength: hex.length,
+            arrayLength,
+          });
           return null;
         }
         
@@ -943,6 +1065,12 @@ export class Multicall {
         
         // Validate tuple position
         if (tupleStart + SLOT * 2 > hex.length) {
+          this.logFastDecodeFailure('tuple_pos_overflow', { 
+            index: i, 
+            tupleStart, 
+            tupleOffsetFromArrayStart,
+            hexLength: hex.length,
+          });
           return null;
         }
         
@@ -963,6 +1091,13 @@ export class Multicall {
         
         // Validate returnData position
         if (returnDataStart + SLOT > hex.length) {
+          this.logFastDecodeFailure('returndata_pos_overflow', { 
+            index: i, 
+            returnDataStart, 
+            returnDataOffsetBytes,
+            tupleStart,
+            hexLength: hex.length,
+          });
           return null;
         }
         
@@ -971,6 +1106,13 @@ export class Multicall {
         
         // Validate return data doesn't exceed hex length
         if (returnDataStart + SLOT + (returnDataLength * 2) > hex.length) {
+          this.logFastDecodeFailure('returndata_length_overflow', { 
+            index: i, 
+            returnDataStart, 
+            returnDataLength,
+            needed: returnDataStart + SLOT + (returnDataLength * 2),
+            hexLength: hex.length,
+          });
           return null;
         }
         
@@ -989,10 +1131,21 @@ export class Multicall {
       }
       
       return { blockNumber, returnData };
-    } catch {
+    } catch (e) {
       // Fall back to full decoder on any error
+      this.logFastDecodeFailure('exception', { 
+        error: e instanceof Error ? e.message : String(e),
+      });
       return null;
     }
+  }
+  
+  /**
+   * Log fast decode failure for diagnostics (only when timing logs are enabled)
+   */
+  private logFastDecodeFailure(reason: string, meta: Record<string, unknown>): void {
+    if (!this._enableTimingLogs) return;
+    console.warn(`[multicall] fastDecode FAILED: ${reason}`, meta);
   }
   
   /**
