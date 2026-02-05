@@ -1,5 +1,6 @@
 import { BigNumber, ethers } from 'ethers';
 import { defaultAbiCoder } from 'ethers/lib/utils';
+import { LRUCache } from 'lru-cache';
 import { fetch, Pool } from 'undici';
 import { ExecutionType, Networks } from './enums';
 import {
@@ -8,7 +9,6 @@ import {
   AggregateCallContext,
   AggregateContractResponse,
   AggregateResponse,
-  CallReturnContext,
   ContractCallContext,
   ContractCallResults,
   ContractCallReturnContext,
@@ -17,7 +17,6 @@ import {
   MulticallOptionsWeb3,
   ContractCallOptions,
 } from './models';
-import { Utils } from './utils';
 
 export class Multicall {
   private readonly ABI = [
@@ -107,6 +106,10 @@ export class Multicall {
   private _cachedNetworkId?: number;
   private _httpPool?: Pool;
   private _multicallInterface?: ethers.utils.Interface;
+  // Cache for ABI interfaces to avoid recreating them for each call
+  private _abiInterfaceCache = new LRUCache<string, ethers.utils.Interface>({ max: 1000 });
+  // Cache for output types to avoid repeated ABI lookups (wrapped to allow undefined)
+  private _outputTypesCache = new LRUCache<string, { outputs: AbiOutput[] | undefined }>({ max: 5000 });
 
   constructor(
     private _options:
@@ -199,10 +202,10 @@ export class Multicall {
       const originalContractCallContext =
         contractCallContexts[contractCallsResults.contractContextIndex];
 
+      // Store reference to original context - avoid expensive deep clone of ABI
+      // Consumers should treat this as read-only
       const returnObjectResult: ContractCallReturnContext = {
-        originalContractCallContext: Utils.deepClone(
-          originalContractCallContext
-        ),
+        originalContractCallContext: originalContractCallContext,
         callsReturnContext: [],
       };
 
@@ -221,17 +224,15 @@ export class Multicall {
         );
 
         if (this._options.tryAggregate && !methodContext.result.success) {
-          returnObjectResult.callsReturnContext.push(
-            Utils.deepClone<CallReturnContext>({
-              returnValues: [methodContext.result.returnData],
-              decoded: false,
-              reference: originalContractCallMethodContext.reference,
-              methodName: originalContractCallMethodContext.methodName,
-              methodParameters:
-                originalContractCallMethodContext.methodParameters,
-              success: false,
-            })
-          );
+          // No need to deepClone - this is a fresh object literal
+          returnObjectResult.callsReturnContext.push({
+            returnValues: [methodContext.result.returnData],
+            decoded: false,
+            reference: originalContractCallMethodContext.reference,
+            methodName: originalContractCallMethodContext.methodName,
+            methodParameters: originalContractCallMethodContext.methodParameters,
+            success: false,
+          });
           continue;
         }
 
@@ -243,45 +244,39 @@ export class Multicall {
               this.getReturnDataFromResult(methodContext.result)
             );
 
-            returnObjectResult.callsReturnContext.push(
-              Utils.deepClone<CallReturnContext>({
-                returnValues: this.formatReturnValues(decodedReturnValues),
-                decoded: true,
-                reference: originalContractCallMethodContext.reference,
-                methodName: originalContractCallMethodContext.methodName,
-                methodParameters:
-                  originalContractCallMethodContext.methodParameters,
-                success: true,
-              })
-            );
+            // No need to deepClone - this is a fresh object literal
+            returnObjectResult.callsReturnContext.push({
+              returnValues: this.formatReturnValues(decodedReturnValues),
+              decoded: true,
+              reference: originalContractCallMethodContext.reference,
+              methodName: originalContractCallMethodContext.methodName,
+              methodParameters: originalContractCallMethodContext.methodParameters,
+              success: true,
+            });
           } catch (e) {
             if (!this._options.tryAggregate) {
               throw e;
             }
-            returnObjectResult.callsReturnContext.push(
-              Utils.deepClone<CallReturnContext>({
-                returnValues: [],
-                decoded: false,
-                reference: originalContractCallMethodContext.reference,
-                methodName: originalContractCallMethodContext.methodName,
-                methodParameters:
-                  originalContractCallMethodContext.methodParameters,
-                success: false,
-              })
-            );
-          }
-        } else {
-          returnObjectResult.callsReturnContext.push(
-            Utils.deepClone<CallReturnContext>({
-              returnValues: this.getReturnDataFromResult(methodContext.result),
+            // No need to deepClone - this is a fresh object literal
+            returnObjectResult.callsReturnContext.push({
+              returnValues: [],
               decoded: false,
               reference: originalContractCallMethodContext.reference,
               methodName: originalContractCallMethodContext.methodName,
-              methodParameters:
-                originalContractCallMethodContext.methodParameters,
-              success: true,
-            })
-          );
+              methodParameters: originalContractCallMethodContext.methodParameters,
+              success: false,
+            });
+          }
+        } else {
+          // No need to deepClone - this is a fresh object literal
+          returnObjectResult.callsReturnContext.push({
+            returnValues: this.getReturnDataFromResult(methodContext.result),
+            decoded: false,
+            reference: originalContractCallMethodContext.reference,
+            methodName: originalContractCallMethodContext.methodName,
+            methodParameters: originalContractCallMethodContext.methodParameters,
+            success: true,
+          });
         }
       }
 
@@ -335,9 +330,19 @@ export class Multicall {
 
     for (let contract = 0; contract < contractCallContexts.length; contract++) {
       const contractContext = contractCallContexts[contract];
-      const executingInterface = new ethers.utils.Interface(
-        JSON.stringify(contractContext.abi)
-      );
+      
+      // Cache interface creation - key includes full function signatures to avoid collisions
+      const abiKey = contractContext.abi.length > 0 
+        ? contractContext.abi.map(item => {
+            const inputs = item.inputs?.map((i: { type: string }) => i.type).join(',') ?? '';
+            return `${item.name}(${inputs})`;
+          }).join('|')
+        : 'empty';
+      let executingInterface = this._abiInterfaceCache.get(abiKey);
+      if (!executingInterface) {
+        executingInterface = new ethers.utils.Interface(contractContext.abi as any);
+        this._abiInterfaceCache.set(abiKey, executingInterface);
+      }
 
       for (let method = 0; method < contractContext.calls.length; method++) {
         // https://github.com/ethers-io/ethers.js/issues/211
@@ -349,8 +354,8 @@ export class Multicall {
         );
 
         aggregateCallContext.push({
-          contractContextIndex: Utils.deepClone<number>(contract),
-          contractMethodIndex: Utils.deepClone<number>(method),
+          contractContextIndex: contract,  // No need to clone primitives
+          contractMethodIndex: method,      // No need to clone primitives
           target: contractContext.contractAddress,
           encodedData,
         });
@@ -361,7 +366,7 @@ export class Multicall {
   }
 
   /**
-   * Find output types from abi
+   * Find output types from abi (with caching for performance)
    * @param abi The abi
    * @param methodName The method name
    */
@@ -369,22 +374,52 @@ export class Multicall {
     abi: AbiItem[],
     methodName: string
   ): AbiOutput[] | undefined {
-    const contract = new ethers.Contract(
-      ethers.constants.AddressZero,
-      abi as any
-    );
     methodName = methodName.trim();
-    if (contract.interface.functions[methodName]) {
-      return contract.interface.functions[methodName].outputs;
+    
+    // Create a cache key from full function signatures to avoid collisions
+    const abiKey = abi.length > 0 
+      ? abi.map(item => {
+          const inputs = item.inputs?.map((i: { type: string }) => i.type).join(',') ?? '';
+          return `${item.name}(${inputs})`;
+        }).join('|')
+      : 'empty';
+    const cacheKey = `${abiKey}:${methodName}`;
+    
+    // Check output types cache first
+    if (this._outputTypesCache.has(cacheKey)) {
+      return this._outputTypesCache.get(cacheKey)!.outputs;
     }
-
-    for (let i = 0; i < abi.length; i++) {
-      if (abi[i].name?.trim() === methodName) {
-        return abi[i].outputs;
+    
+    // Get or create cached interface for this ABI
+    let iface = this._abiInterfaceCache.get(abiKey);
+    if (!iface) {
+      try {
+        iface = new ethers.utils.Interface(abi as any);
+        this._abiInterfaceCache.set(abiKey, iface);
+      } catch {
+        // If interface creation fails, fall back to manual search
+        iface = undefined;
       }
     }
-
-    return undefined;
+    
+    let outputs: AbiOutput[] | undefined;
+    
+    // Try to get outputs from interface
+    if (iface?.functions[methodName]) {
+      outputs = iface.functions[methodName].outputs;
+    } else {
+      // Fall back to manual ABI search
+      for (let i = 0; i < abi.length; i++) {
+        if (abi[i].name?.trim() === methodName) {
+          outputs = abi[i].outputs;
+          break;
+        }
+      }
+    }
+    
+    // Cache the result
+    this._outputTypesCache.set(cacheKey, { outputs });
+    return outputs;
   }
 
   /**

@@ -13,6 +13,7 @@ __metadata:
     "@types/node": ^18.0.0
     ethereum-abi-types-generator: ^1.0.6
     ethers: 5.8.0
+    lru-cache: ^11.2.5
     typescript: ^4.1.3
     undici: ^6.6.2
   languageName: unknown
@@ -1231,6 +1232,13 @@ __metadata:
   dependencies:
     p-locate: ^4.1.0
   checksum: 83e51725e67517287d73e1ded92b28602e3ae5580b301fe54bfb76c0c723e3f285b19252e375712316774cf52006cb236aed5704692c32db0d5d089b69696e30
+  languageName: node
+  linkType: hard
+
+"lru-cache@npm:^11.2.5":
+  version: 11.2.5
+  resolution: "lru-cache@npm:11.2.5"
+  checksum: b3cd18066c81e0540429507036e0a37f860325348f6a85376ed71196e5b893668af410849574c5fb49110bc0afff76b4f87646cb93b2482a315c9e7b8435630f
   languageName: node
   linkType: hard
 
