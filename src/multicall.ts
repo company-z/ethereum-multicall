@@ -877,8 +877,8 @@ export class Multicall {
    * Response format for tryBlockAndAggregate(false, calls[]):
    * - bytes32: blockNumber (slot 0)
    * - bytes32: blockHash (slot 1)
-   * - offset to results array (slot 2, always 0x60 = 96)
-   * - At offset 96: array length
+   * - offset to results array (slot 2)
+   * - At that offset: array length
    * - Then: offsets to each Result tuple (relative to array start)
    * - Then: Result tuples, each containing {success: bool, returnData: bytes}
    */
@@ -892,31 +892,59 @@ export class Multicall {
       // Each slot is 32 bytes = 64 hex chars
       const SLOT = 64;
       
+      // Validate minimum length (at least 3 slots for header)
+      if (hex.length < SLOT * 3) {
+        return null;
+      }
+      
       // blockNumber is first 32 bytes
       const blockNumber = BigNumber.from('0x' + hex.slice(0, SLOT));
       
       // blockHash is next 32 bytes (slot 1) - we don't need it
-      // Offset to results array is at slot 2 (always 0x60 = 96 bytes from start)
       
-      // Array data starts at byte offset 96 (hex position 192)
-      // First value at array start is the array length
-      const arrayDataStart = 192; // 96 bytes * 2 hex chars
+      // Slot 2: offset to results array (in bytes, relative to start)
+      // Read actual offset instead of assuming 96
+      const arrayOffsetBytes = parseInt(hex.slice(SLOT * 2, SLOT * 3), 16);
+      const arrayDataStart = arrayOffsetBytes * 2; // Convert bytes to hex chars
+      
+      // Validate offset is reasonable
+      if (arrayDataStart < SLOT * 3 || arrayDataStart >= hex.length) {
+        return null;
+      }
+      
+      // First value at array data is the array length
       const arrayLength = parseInt(hex.slice(arrayDataStart, arrayDataStart + SLOT), 16);
       
+      // Sanity check array length
+      if (arrayLength > 10000 || arrayLength < 0 || isNaN(arrayLength)) {
+        return null;
+      }
+      
       // After length comes `arrayLength` offsets, each pointing to a Result tuple
-      // These offsets are relative to the start of the array data (byte 96)
+      // These offsets are relative to the start of the array data
       const offsetsStart = arrayDataStart + SLOT;
       
       // Use any[] to match the loose typing used elsewhere for returnData
       const returnData: any[] = new Array(arrayLength);
       
       for (let i = 0; i < arrayLength; i++) {
-        // Get offset for this result tuple (relative to array data start at byte 96)
+        // Get offset for this result tuple (relative to array data start)
         const offsetPos = offsetsStart + (i * SLOT);
+        
+        // Validate we have enough data
+        if (offsetPos + SLOT > hex.length) {
+          return null;
+        }
+        
         const tupleOffsetFromArrayStart = parseInt(hex.slice(offsetPos, offsetPos + SLOT), 16);
         
         // Tuple position in hex string: arrayDataStart + (tupleOffsetFromArrayStart * 2)
         const tupleStart = arrayDataStart + (tupleOffsetFromArrayStart * 2);
+        
+        // Validate tuple position
+        if (tupleStart + SLOT * 2 > hex.length) {
+          return null;
+        }
         
         // Result tuple structure:
         // - slot 0: success (bool, right-padded in 32 bytes)
@@ -933,8 +961,18 @@ export class Multicall {
         // returnData position: tupleStart + (returnDataOffsetBytes * 2)
         const returnDataStart = tupleStart + (returnDataOffsetBytes * 2);
         
+        // Validate returnData position
+        if (returnDataStart + SLOT > hex.length) {
+          return null;
+        }
+        
         // First 32 bytes at returnData position: length of the bytes
         const returnDataLength = parseInt(hex.slice(returnDataStart, returnDataStart + SLOT), 16);
+        
+        // Validate return data doesn't exceed hex length
+        if (returnDataStart + SLOT + (returnDataLength * 2) > hex.length) {
+          return null;
+        }
         
         // Actual bytes follow the length (returnDataLength bytes = returnDataLength * 2 hex chars)
         let returnDataHex: string;
