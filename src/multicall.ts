@@ -317,6 +317,7 @@ export class Multicall {
 
   /**
    * Format return values so its always an array
+   * Converts BigNumber to decimal strings for consistency with fast path
    * @param decodedReturnValues The decoded return values
    */
   // tslint:disable-next-line: no-any
@@ -327,10 +328,31 @@ export class Multicall {
     }
 
     if (Array.isArray(decodedReturnResults)) {
-      return decodedReturnResults;
+      return decodedReturnResults.map((val: any) => this.normalizeValue(val));
     }
 
-    return [decodedReturnResults];
+    return [this.normalizeValue(decodedReturnResults)];
+  }
+  
+  /**
+   * Normalize a decoded value to match fast path return types
+   * Converts BigNumber to decimal string, leaves other types unchanged
+   * @param value The value to normalize
+   */
+  // tslint:disable-next-line: no-any
+  private normalizeValue(value: any): any {
+    // Convert BigNumber to decimal string
+    if (BigNumber.isBigNumber(value)) {
+      return value.toString();
+    }
+    
+    // Recursively handle arrays (for tuple returns)
+    if (Array.isArray(value)) {
+      return value.map((v: any) => this.normalizeValue(v));
+    }
+    
+    // Leave other types unchanged (string, boolean, bytes)
+    return value;
   }
 
   /**
@@ -395,35 +417,41 @@ export class Multicall {
     const type = outputTypes[0].type;
     
     // uint256/uint128/etc - most common case for balance calls
+    // Returns decimal string for maximum performance (avoids BigNumber overhead)
     if (type === 'uint256' || type === 'uint128' || type === 'uint64' || 
         type === 'uint32' || type === 'uint16' || type === 'uint8') {
       try {
-        // Return BigNumber to match ethers ABI decoder behavior
-        return [BigNumber.from(returnData)];
+        return [BigInt(returnData).toString(10)];
       } catch {
         return null; // Fall back to full decoder on error
       }
     }
     
     // int256/int128/etc - signed integers
+    // Returns decimal string for maximum performance (avoids BigNumber overhead)
     if (type === 'int256' || type === 'int128' || type === 'int64' ||
         type === 'int32' || type === 'int16' || type === 'int8') {
       try {
-        // For signed integers, we need to handle two's complement
         // Sign bit threshold and max value for each type
-        const bitWidth: Record<string, number> = {
-          'int256': 256,
-          'int128': 128,
-          'int64': 64,
-          'int32': 32,
-          'int16': 16,
-          'int8': 8,
+        const signedBitInfo: Record<string, { signBit: bigint; maxVal: bigint }> = {
+          'int256': { signBit: 1n << 255n, maxVal: 1n << 256n },
+          'int128': { signBit: 1n << 127n, maxVal: 1n << 128n },
+          'int64':  { signBit: 1n << 63n,  maxVal: 1n << 64n },
+          'int32':  { signBit: 1n << 31n,  maxVal: 1n << 32n },
+          'int16':  { signBit: 1n << 15n,  maxVal: 1n << 16n },
+          'int8':   { signBit: 1n << 7n,   maxVal: 1n << 8n },
         };
         
-        // Use BigNumber's fromTwos to match ethers ABI decoder behavior
-        const bits = bitWidth[type];
-        const value = BigNumber.from(returnData).mask(bits).fromTwos(bits);
-        return [value];
+        const bn = BigInt(returnData);
+        const { signBit, maxVal } = signedBitInfo[type];
+        
+        // Mask to the correct bit width, then check sign bit
+        const masked = bn & (maxVal - 1n);
+        if (masked >= signBit) {
+          // Negative number in two's complement
+          return [(masked - maxVal).toString(10)];
+        }
+        return [masked.toString(10)];
       } catch {
         return null;
       }
@@ -432,8 +460,8 @@ export class Multicall {
     // address type
     if (type === 'address') {
       try {
-        // Extract last 40 chars (20 bytes) from the 32-byte word
-        const addr = '0x' + returnData.slice(-40).toLowerCase();
+        // Extract last 40 chars (20 bytes) and checksum to match ABI decoder
+        const addr = ethers.utils.getAddress('0x' + returnData.slice(-40));
         return [addr];
       } catch {
         return null;
