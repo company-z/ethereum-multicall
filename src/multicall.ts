@@ -461,6 +461,25 @@ export class Multicall {
   }
 
   /**
+   * Build a stable ABI cache key that includes function inputs and outputs.
+   * Including outputs avoids collisions for functions with the same name/inputs
+   * but different return shapes (e.g. slot0 variants across protocols).
+   */
+  private buildAbiCacheKey(abi: AbiItem[]): string {
+    if (!abi || abi.length === 0) return 'empty';
+
+    return abi
+      .map((item) => {
+        const inputs =
+          item.inputs?.map((i: { type: string }) => i.type).join(',') ?? '';
+        const outputs =
+          item.outputs?.map((o: { type: string }) => o.type).join(',') ?? '';
+        return `${item.name}(${inputs})->(${outputs})`;
+      })
+      .join('|');
+  }
+
+  /**
    * Build aggregate call context
    * @param contractCallContexts The contract call contexts
    */
@@ -472,13 +491,9 @@ export class Multicall {
     for (let contract = 0; contract < contractCallContexts.length; contract++) {
       const contractContext = contractCallContexts[contract];
       
-      // Cache interface creation - key includes full function signatures to avoid collisions
-      const abiKey = contractContext.abi.length > 0 
-        ? contractContext.abi.map(item => {
-            const inputs = item.inputs?.map((i: { type: string }) => i.type).join(',') ?? '';
-            return `${item.name}(${inputs})`;
-          }).join('|')
-        : 'empty';
+      // Cache interface creation - include outputs in key to avoid collisions
+      // between functions that share name/inputs but differ in return types.
+      const abiKey = this.buildAbiCacheKey(contractContext.abi);
       let executingInterface = this._abiInterfaceCache.get(abiKey);
       if (!executingInterface) {
         executingInterface = new ethers.utils.Interface(contractContext.abi as any);
@@ -603,13 +618,9 @@ export class Multicall {
   ): AbiOutput[] | undefined {
     methodName = methodName.trim();
     
-    // Create a cache key from full function signatures to avoid collisions
-    const abiKey = abi.length > 0 
-      ? abi.map(item => {
-          const inputs = item.inputs?.map((i: { type: string }) => i.type).join(',') ?? '';
-          return `${item.name}(${inputs})`;
-        }).join('|')
-      : 'empty';
+    // Include outputs in the key to avoid collisions across protocols where
+    // method name + inputs match but output tuple shape differs.
+    const abiKey = this.buildAbiCacheKey(abi);
     const cacheKey = `${abiKey}:${methodName}`;
     
     // Check output types cache first
