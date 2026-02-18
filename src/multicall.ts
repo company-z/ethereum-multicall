@@ -16,6 +16,7 @@ import {
   MulticallOptionsEthers,
   MulticallOptionsWeb3,
   ContractCallOptions,
+  TimingLogger,
 } from './models';
 
 export class Multicall {
@@ -110,6 +111,16 @@ export class Multicall {
   private _abiInterfaceCache = new LRUCache<string, ethers.utils.Interface>({ max: 1000 });
   // Cache for output types to avoid repeated ABI lookups (wrapped to allow undefined)
   private _outputTypesCache = new LRUCache<string, { outputs: AbiOutput[] | undefined }>({ max: 5000 });
+  
+  // Timing infrastructure
+  private _enableTimingLogs = false;
+  private _timingLogger: TimingLogger = (message, meta) => {
+    if (meta) {
+      console.log(`[multicall-timing] ${message}`, meta);
+    } else {
+      console.log(`[multicall-timing] ${message}`);
+    }
+  };
 
   constructor(
     private _options:
@@ -117,6 +128,14 @@ export class Multicall {
       | MulticallOptionsEthers
       | MulticallOptionsCustomJsonRpcProvider
   ) {
+    // Configure timing options (do this first as it applies to all execution types)
+    if (this._options.enableTimingLogs !== undefined) {
+      this._enableTimingLogs = this._options.enableTimingLogs;
+    }
+    if (this._options.timingLogger !== undefined) {
+      this._timingLogger = this._options.timingLogger;
+    }
+    
     if ((this._options as MulticallOptionsWeb3).web3Instance) {
       this._executionType = ExecutionType.web3;
       return;
@@ -152,6 +171,22 @@ export class Multicall {
   }
   
   /**
+   * Log timing information if timing logs are enabled.
+   */
+  private logTiming(
+    phase: string,
+    durationMs: number,
+    meta?: Record<string, unknown>
+  ): void {
+    if (!this._enableTimingLogs) return;
+    this._timingLogger(`${phase}: ${durationMs.toFixed(2)}ms`, {
+      phase,
+      durationMs,
+      ...meta,
+    });
+  }
+  
+  /**
    * Close the HTTP pool connection (call when done with multicall instance)
    */
   public async close(): Promise<void> {
@@ -179,20 +214,46 @@ export class Multicall {
     contractCallContexts: ContractCallContext[] | ContractCallContext,
     contractCallOptions: ContractCallOptions = {}
   ): Promise<ContractCallResults> {
+    const callStartTime = Date.now();
+    
     if (!Array.isArray(contractCallContexts)) {
       contractCallContexts = [contractCallContexts];
     }
+    
+    const totalCalls = contractCallContexts.reduce(
+      (sum, ctx) => sum + ctx.calls.length,
+      0
+    );
 
+    // Phase 1: Build aggregate call context (encoding)
+    const encodeStartTime = Date.now();
+    const aggregateCallContext = this.buildAggregateCallContext(contractCallContexts);
+    this.logTiming('buildAggregateCallContext', Date.now() - encodeStartTime, {
+      contractCount: contractCallContexts.length,
+      totalCalls,
+    });
+    
+    // Phase 2: Execute the multicall (network request)
+    const executeStartTime = Date.now();
     const aggregateResponse = await this.execute(
-      this.buildAggregateCallContext(contractCallContexts),
+      aggregateCallContext,
       contractCallOptions
     );
+    this.logTiming('execute', Date.now() - executeStartTime, {
+      totalCalls,
+    });
 
     const returnObject: ContractCallResults = {
       results: {},
       blockNumber: aggregateResponse.blockNumber,
     };
 
+    // Phase 3: Decode and format results
+    const decodeStartTime = Date.now();
+    let decodeCount = 0;
+    let fastDecodeCount = 0;
+    let fullDecodeCount = 0;
+    
     for (
       let response = 0;
       response < aggregateResponse.results.length;
@@ -248,7 +309,9 @@ export class Multicall {
             // Try fast path for simple types first (avoids expensive ABI decoder)
             let decodedReturnValues: any[] | null = this.fastDecodeSimpleType(returnData, outputTypes);
             
-            if (!decodedReturnValues) {
+            if (decodedReturnValues) {
+              fastDecodeCount++;
+            } else {
               // Fall back to full ABI decoder for complex types
               const decoded = defaultAbiCoder.decode(
                 // tslint:disable-next-line: no-any
@@ -256,7 +319,9 @@ export class Multicall {
                 returnData
               );
               decodedReturnValues = this.formatReturnValues(decoded);
+              fullDecodeCount++;
             }
+            decodeCount++;
 
             // Place result at the correct index (not push) to maintain correspondence with calls array
             returnObjectResult.callsReturnContext[callIndex] = {
@@ -298,6 +363,18 @@ export class Multicall {
         returnObjectResult.originalContractCallContext.reference
       ] = returnObjectResult;
     }
+    
+    this.logTiming('decodeResults', Date.now() - decodeStartTime, {
+      decodeCount,
+      fastDecodeCount,
+      fullDecodeCount,
+    });
+    
+    this.logTiming('call:total', Date.now() - callStartTime, {
+      contractCount: contractCallContexts.length,
+      totalCalls,
+      blockNumber: aggregateResponse.blockNumber,
+    });
 
     return returnObject;
   }
@@ -384,6 +461,25 @@ export class Multicall {
   }
 
   /**
+   * Build a stable ABI cache key that includes function inputs and outputs.
+   * Including outputs avoids collisions for functions with the same name/inputs
+   * but different return shapes (e.g. slot0 variants across protocols).
+   */
+  private buildAbiCacheKey(abi: AbiItem[]): string {
+    if (!abi || abi.length === 0) return 'empty';
+
+    return abi
+      .map((item) => {
+        const inputs =
+          item.inputs?.map((i: { type: string }) => i.type).join(',') ?? '';
+        const outputs =
+          item.outputs?.map((o: { type: string }) => o.type).join(',') ?? '';
+        return `${item.name}(${inputs})->(${outputs})`;
+      })
+      .join('|');
+  }
+
+  /**
    * Build aggregate call context
    * @param contractCallContexts The contract call contexts
    */
@@ -395,13 +491,9 @@ export class Multicall {
     for (let contract = 0; contract < contractCallContexts.length; contract++) {
       const contractContext = contractCallContexts[contract];
       
-      // Cache interface creation - key includes full function signatures to avoid collisions
-      const abiKey = contractContext.abi.length > 0 
-        ? contractContext.abi.map(item => {
-            const inputs = item.inputs?.map((i: { type: string }) => i.type).join(',') ?? '';
-            return `${item.name}(${inputs})`;
-          }).join('|')
-        : 'empty';
+      // Cache interface creation - include outputs in key to avoid collisions
+      // between functions that share name/inputs but differ in return types.
+      const abiKey = this.buildAbiCacheKey(contractContext.abi);
       let executingInterface = this._abiInterfaceCache.get(abiKey);
       if (!executingInterface) {
         executingInterface = new ethers.utils.Interface(contractContext.abi as any);
@@ -526,13 +618,9 @@ export class Multicall {
   ): AbiOutput[] | undefined {
     methodName = methodName.trim();
     
-    // Create a cache key from full function signatures to avoid collisions
-    const abiKey = abi.length > 0 
-      ? abi.map(item => {
-          const inputs = item.inputs?.map((i: { type: string }) => i.type).join(',') ?? '';
-          return `${item.name}(${inputs})`;
-        }).join('|')
-      : 'empty';
+    // Include outputs in the key to avoid collisions across protocols where
+    // method name + inputs match but output tuple shape differs.
+    const abiKey = this.buildAbiCacheKey(abi);
     const cacheKey = `${abiKey}:${methodName}`;
     
     // Check output types cache first
@@ -843,16 +931,252 @@ export class Multicall {
       throw new Error('RPC returned empty result');
     }
     
-    // Decode the response
-    const methodName = this._options.tryAggregate ? 'tryBlockAndAggregate' : 'aggregate';
-    const decoded = multicallInterface.decodeFunctionResult(methodName, responseData.result);
+    // Decode the response - use fast path for tryBlockAndAggregate
+    const decodeStartTime = Date.now();
+    let contractResponse: AggregateContractResponse;
+    let usedFastDecode = false;
     
-    const contractResponse: AggregateContractResponse = {
-      blockNumber: BigNumber.from(decoded.blockNumber),
-      returnData: decoded.returnData,
-    };
+    if (this._options.tryAggregate) {
+      // Try fast decode first (avoids expensive ABI decoder for large responses)
+      const fastDecodeStartTime = Date.now();
+      const fastDecoded = this.fastDecodeTryBlockAndAggregate(responseData.result);
+      const fastDecodeDuration = Date.now() - fastDecodeStartTime;
+      
+      if (fastDecoded) {
+        contractResponse = fastDecoded;
+        usedFastDecode = true;
+        this.logTiming('undici:fastDecode', fastDecodeDuration, {
+          success: true,
+          resultLength: responseData.result.length,
+          callCount: fastDecoded.returnData.length,
+        });
+      } else {
+        // Fall back to full decoder on error
+        this.logTiming('undici:fastDecode', fastDecodeDuration, {
+          success: false,
+          resultLength: responseData.result.length,
+        });
+        
+        const ethersDecodeStartTime = Date.now();
+        const decoded = multicallInterface.decodeFunctionResult('tryBlockAndAggregate', responseData.result);
+        contractResponse = {
+          blockNumber: BigNumber.from(decoded.blockNumber),
+          returnData: decoded.returnData,
+        };
+        this.logTiming('undici:ethersDecode:tryBlockAndAggregate', Date.now() - ethersDecodeStartTime, {
+          callCount: decoded.returnData.length,
+          resultLength: responseData.result.length,
+        });
+      }
+    } else {
+      const ethersDecodeStartTime = Date.now();
+      const decoded = multicallInterface.decodeFunctionResult('aggregate', responseData.result);
+      contractResponse = {
+        blockNumber: BigNumber.from(decoded.blockNumber),
+        returnData: decoded.returnData,
+      };
+      this.logTiming('undici:ethersDecode:aggregate', Date.now() - ethersDecodeStartTime, {
+        callCount: decoded.returnData.length,
+        resultLength: responseData.result.length,
+      });
+    }
+    
+    this.logTiming('undici:decode:total', Date.now() - decodeStartTime, {
+      usedFastDecode,
+      callCount: contractResponse.returnData.length,
+    });
     
     return this.buildUpAggregateResponse(contractResponse, calls);
+  }
+
+  /**
+   * Fast decode for tryBlockAndAggregate response without full ABI decoder.
+   * Uses Buffer for high-performance binary parsing instead of string operations.
+   * 
+   * Response format for tryBlockAndAggregate(false, calls[]):
+   * - bytes32: blockNumber (slot 0)
+   * - bytes32: blockHash (slot 1)
+   * - offset to results array (slot 2)
+   * - At that offset: array length
+   * - Then: offsets to each Result tuple (relative to position after length)
+   * - Then: Result tuples, each containing {success: bool, returnData: bytes}
+   */
+  private fastDecodeTryBlockAndAggregate(
+    data: string
+  ): AggregateContractResponse | null {
+    try {
+      // Convert hex string to Buffer ONCE - this is the only major allocation
+      const hexStr = data.startsWith('0x') ? data.slice(2) : data;
+      const buf = Buffer.from(hexStr, 'hex');
+      
+      const SLOT = 32; // 32 bytes per slot
+      
+      // Validate minimum length (at least 3 slots for header)
+      if (buf.length < SLOT * 3) {
+        this.logFastDecodeFailure('hex_too_short', { bufLength: buf.length, minRequired: SLOT * 3 });
+        return null;
+      }
+      
+      // Read blockNumber directly from buffer (first 32 bytes)
+      const blockNumber = BigNumber.from(buf.subarray(0, SLOT));
+      
+      // blockHash is next 32 bytes (slot 1) - we don't need it
+      
+      // Slot 2: offset to results array (read last 4 bytes of slot - offsets fit in uint32)
+      const arrayOffsetBytes = buf.readUInt32BE(SLOT * 2 + 28);
+      
+      // Validate offset is reasonable
+      if (arrayOffsetBytes < SLOT * 3 || arrayOffsetBytes >= buf.length) {
+        this.logFastDecodeFailure('invalid_array_offset', { 
+          arrayOffsetBytes, 
+          bufLength: buf.length,
+          minExpected: SLOT * 3,
+        });
+        return null;
+      }
+      
+      // Array length (last 4 bytes of the length slot)
+      const arrayLength = buf.readUInt32BE(arrayOffsetBytes + 28);
+      
+      // Sanity check array length
+      if (arrayLength > 10000 || arrayLength < 0) {
+        this.logFastDecodeFailure('invalid_array_length', { arrayLength });
+        return null;
+      }
+      
+      // offsetsStart is right after the array length (where ethers anchors baseReader)
+      const offsetsStart = arrayOffsetBytes + SLOT;
+      
+      // Debug: Log structure analysis
+      if (this._enableTimingLogs) {
+        const expectedFirstTupleBytePos = arrayOffsetBytes + SLOT + (arrayLength * SLOT);
+        const firstOffsetValue =
+          arrayLength > 0 && offsetsStart + SLOT <= buf.length
+            ? buf.readUInt32BE(offsetsStart + 28)
+            : undefined;
+        
+        console.log('[multicall] fastDecode structure analysis:', {
+          arrayOffsetBytes,
+          arrayLength,
+          offsetsStart,
+          firstOffsetValue,
+          expectedFirstTupleBytePos,
+          calculatedFirstTupleBytePos:
+            firstOffsetValue !== undefined
+              ? offsetsStart + firstOffsetValue
+              : undefined,
+          bufLength: buf.length,
+        });
+      }
+      
+      // Use any[] to match the loose typing used elsewhere for returnData
+      const returnData: any[] = new Array(arrayLength);
+      
+      for (let i = 0; i < arrayLength; i++) {
+        // Get offset for this result tuple
+        const offsetPos = offsetsStart + (i * SLOT);
+        
+        // Validate we have enough data
+        if (offsetPos + SLOT > buf.length) {
+          this.logFastDecodeFailure('offset_pos_overflow', { 
+            index: i, 
+            offsetPos, 
+            bufLength: buf.length,
+            arrayLength,
+          });
+          return null;
+        }
+        
+        // Read tuple offset (last 4 bytes of slot - offsets fit in uint32)
+        const tupleOffset = buf.readUInt32BE(offsetPos + 28);
+        
+        // Tuple position: offsetsStart + tupleOffset
+        // (offsets are relative to position after array length, where ethers anchors baseReader)
+        const tupleStart = offsetsStart + tupleOffset;
+        
+        // Validate tuple position
+        if (tupleStart + SLOT * 2 > buf.length) {
+          this.logFastDecodeFailure('tuple_pos_overflow', { 
+            index: i, 
+            tupleStart, 
+            tupleOffset,
+            bufLength: buf.length,
+          });
+          return null;
+        }
+        
+        // Result tuple structure:
+        // - slot 0: success (bool, right-padded in 32 bytes)
+        // - slot 1: offset to returnData bytes (relative to tuple start)
+        // - at that offset: length of bytes, then the bytes data
+        
+        // Success: check if any byte in the slot is non-zero (fast path: check last byte first)
+        let success = buf[tupleStart + 31] !== 0;
+        if (!success) {
+          // Full check only if last byte was zero
+          for (let j = tupleStart; j < tupleStart + 31; j++) {
+            if (buf[j] !== 0) {
+              success = true;
+              break;
+            }
+          }
+        }
+        
+        // ReturnData offset (last 4 bytes of slot)
+        const returnDataOffset = buf.readUInt32BE(tupleStart + SLOT + 28);
+        const returnDataStart = tupleStart + returnDataOffset;
+        
+        // Validate returnData position
+        if (returnDataStart + SLOT > buf.length) {
+          this.logFastDecodeFailure('returndata_pos_overflow', { 
+            index: i, 
+            returnDataStart, 
+            returnDataOffset,
+            tupleStart,
+            bufLength: buf.length,
+          });
+          return null;
+        }
+        
+        // ReturnData length (last 4 bytes of length slot)
+        const returnDataLength = buf.readUInt32BE(returnDataStart + 28);
+        
+        // Validate return data doesn't exceed buffer length
+        if (returnDataStart + SLOT + returnDataLength > buf.length) {
+          this.logFastDecodeFailure('returndata_length_overflow', { 
+            index: i, 
+            returnDataStart, 
+            returnDataLength,
+            needed: returnDataStart + SLOT + returnDataLength,
+            bufLength: buf.length,
+          });
+          return null;
+        }
+        
+        // Extract returnData as hex string - subarray is zero-copy!
+        const returnDataHex = returnDataLength === 0
+          ? '0x'
+          : '0x' + buf.subarray(returnDataStart + SLOT, returnDataStart + SLOT + returnDataLength).toString('hex');
+        
+        returnData[i] = { success, returnData: returnDataHex };
+      }
+      
+      return { blockNumber, returnData };
+    } catch (e) {
+      // Fall back to full decoder on any error
+      this.logFastDecodeFailure('exception', { 
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return null;
+    }
+  }
+  
+  /**
+   * Log fast decode failure for diagnostics (only when timing logs are enabled)
+   */
+  private logFastDecodeFailure(reason: string, meta: Record<string, unknown>): void {
+    if (!this._enableTimingLogs) return;
+    console.warn(`[multicall] fastDecode FAILED: ${reason}`, meta);
   }
   
   /**

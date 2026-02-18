@@ -1,5 +1,12 @@
 import { Provider } from '@ethersproject/providers';
 
+/**
+ * Logger function type for timing logs.
+ * @param message The log message (e.g., "phase: 10.00ms")
+ * @param meta Optional metadata object with structured timing info
+ */
+export type TimingLogger = (message: string, meta?: Record<string, unknown>) => void;
+
 interface MulticallOptionsBase {
   multicallCustomContractAddress?: string;
   tryAggregate?: boolean;
@@ -15,6 +22,15 @@ interface MulticallOptionsBase {
    * Provides 2-3x throughput improvement via connection pooling.
    */
   useUndici?: boolean;
+  /**
+   * Enable timing logs for multicall flow phases.
+   * Default: false
+   */
+  enableTimingLogs?: boolean;
+  /**
+   * Custom logger function for timing logs. Defaults to console.log with [multicall-timing] prefix.
+   */
+  timingLogger?: TimingLogger;
 }
 
 export interface MulticallOptionsWeb3 extends MulticallOptionsBase {
