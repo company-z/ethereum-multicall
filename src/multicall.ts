@@ -1050,7 +1050,10 @@ export class Multicall {
       // Debug: Log structure analysis
       if (this._enableTimingLogs) {
         const expectedFirstTupleBytePos = arrayOffsetBytes + SLOT + (arrayLength * SLOT);
-        const firstOffsetValue = buf.readUInt32BE(offsetsStart + 28);
+        const firstOffsetValue =
+          arrayLength > 0 && offsetsStart + SLOT <= buf.length
+            ? buf.readUInt32BE(offsetsStart + 28)
+            : undefined;
         
         console.log('[multicall] fastDecode structure analysis:', {
           arrayOffsetBytes,
@@ -1058,7 +1061,10 @@ export class Multicall {
           offsetsStart,
           firstOffsetValue,
           expectedFirstTupleBytePos,
-          calculatedFirstTupleBytePos: offsetsStart + firstOffsetValue,
+          calculatedFirstTupleBytePos:
+            firstOffsetValue !== undefined
+              ? offsetsStart + firstOffsetValue
+              : undefined,
           bufLength: buf.length,
         });
       }
