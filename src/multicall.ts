@@ -919,8 +919,16 @@ export class Multicall {
     };
     const jsonDuration = Date.now() - jsonStartTime;
     
+    // Log the RPC host only — provider URLs embed API keys in the path
+    // (e.g. Alchemy), so the full URL must never reach logs.
+    let nodeHost: string;
+    try {
+      nodeHost = new URL(customProvider.nodeUrl).host;
+    } catch {
+      nodeHost = 'unparseable-url';
+    }
     console.log(
-      `[multicall] calls=${calls.length} block=${blockTag} compression=${contentEncoding} fetch=${fetchDuration}ms json=${jsonDuration}ms url=${customProvider.nodeUrl}`
+      `[multicall] calls=${calls.length} block=${blockTag} compression=${contentEncoding} fetch=${fetchDuration}ms json=${jsonDuration}ms host=${nodeHost}`
     );
     
     if (responseData.error) {
