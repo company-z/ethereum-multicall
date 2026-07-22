@@ -1235,8 +1235,16 @@ export class Multicall {
       
       this._cachedNetworkId = parseInt(responseData.result, 16);
       
+      // Log the RPC host only — provider URLs embed API keys in the path
+      // (e.g. Alchemy), so the full URL must never reach logs.
+      let chainIdNodeHost: string;
+      try {
+        chainIdNodeHost = new URL(customProvider.nodeUrl).host;
+      } catch {
+        chainIdNodeHost = 'unparseable-url';
+      }
       console.log(
-        `[eth_chainId] networkId=${this._cachedNetworkId} compression=${contentEncoding} fetch=${fetchDuration}ms json=${jsonDuration}ms url=${customProvider.nodeUrl}`
+        `[eth_chainId] networkId=${this._cachedNetworkId} compression=${contentEncoding} fetch=${fetchDuration}ms json=${jsonDuration}ms host=${chainIdNodeHost}`
       );
       
       return this._cachedNetworkId;
