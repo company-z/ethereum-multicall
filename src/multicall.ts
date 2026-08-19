@@ -19,6 +19,13 @@ import {
   TimingLogger,
 } from './models';
 
+// Default per-request timeout for the undici path. Healthy multicalls run in
+// the tens-to-hundreds of milliseconds; without a timeout, a silently dead
+// socket hangs the caller until undici's ~300s defaults and keeps the pooled
+// connection checked out. Aborting destroys the connection, so the pool
+// recovers immediately instead of serving the corpse to retries.
+const DEFAULT_UNDICI_TIMEOUT_MS = 30_000;
+
 export class Multicall {
   private readonly ABI = [
     {
@@ -106,6 +113,7 @@ export class Multicall {
   private _cachedProvider?: ethers.providers.Provider;
   private _cachedNetworkId?: number;
   private _httpPool?: Pool;
+  private _undiciTimeoutMs = DEFAULT_UNDICI_TIMEOUT_MS;
   private _multicallInterface?: ethers.utils.Interface;
   // Cache for ABI interfaces to avoid recreating them for each call
   private _abiInterfaceCache = new LRUCache<string, ethers.utils.Interface>({ max: 1000 });
@@ -151,6 +159,9 @@ export class Multicall {
       
       // Initialize undici pool for high-performance HTTP if enabled
       if (this._options.useUndici) {
+        if (this._options.undiciTimeoutMs !== undefined) {
+          this._undiciTimeoutMs = this._options.undiciTimeoutMs;
+        }
         const nodeUrl = (this._options as MulticallOptionsCustomJsonRpcProvider).nodeUrl;
         const url = new URL(nodeUrl);
         this._httpPool = new Pool(url.origin, {
@@ -892,7 +903,9 @@ export class Multicall {
       ],
     };
     
-    // Make the request using undici fetch with pool dispatcher (auto-decompression)
+    // Make the request using undici fetch with pool dispatcher (auto-decompression).
+    // The abort signal also covers response-body consumption below, and firing
+    // it destroys the pooled connection rather than returning it.
     const startTime = Date.now();
     const response = await fetch(customProvider.nodeUrl, {
       method: 'POST',
@@ -901,6 +914,7 @@ export class Multicall {
         'Accept-Encoding': 'gzip, deflate',
       },
       body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(this._undiciTimeoutMs),
       dispatcher: this._httpPool,
     });
     const fetchDuration = Date.now() - startTime;
@@ -1219,6 +1233,7 @@ export class Multicall {
           'Accept-Encoding': 'gzip, deflate',
         },
         body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(this._undiciTimeoutMs),
         dispatcher: this._httpPool,
       });
       const fetchDuration = Date.now() - startTime;

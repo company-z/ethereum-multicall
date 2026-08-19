@@ -23,6 +23,12 @@ interface MulticallOptionsBase {
    */
   useUndici?: boolean;
   /**
+   * Per-request timeout in milliseconds for undici requests. When it fires,
+   * the request is aborted and its pooled connection is destroyed, so a dead
+   * socket cannot wedge the caller or poison the pool. Default: 30000.
+   */
+  undiciTimeoutMs?: number;
+  /**
    * Enable timing logs for multicall flow phases.
    * Default: false
    */
