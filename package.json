@@ -45,9 +45,13 @@
     "blockchain",
     "JSONRPC"
   ],
-  "bugs": {
-    "url": "https://github.com/joshstevens19/ethereum-multicall/issues"
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/company-z/ethereum-multicall.git"
   },
-  "homepage": "https://github.com/joshstevens19/ethereum-multicall#readme",
+  "bugs": {
+    "url": "https://github.com/company-z/ethereum-multicall/issues"
+  },
+  "homepage": "https://github.com/company-z/ethereum-multicall#readme",
   "packageManager": "yarn@3.5.0"
 }
