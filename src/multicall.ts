@@ -1,7 +1,7 @@
 import { BigNumber, ethers } from 'ethers';
 import { defaultAbiCoder } from 'ethers/lib/utils';
 import { LRUCache } from 'lru-cache';
-import { fetch, Pool } from 'undici';
+import { Pool } from 'undici';
 import { ExecutionType, Networks } from './enums';
 import {
   AbiItem,
@@ -18,6 +18,7 @@ import {
   ContractCallOptions,
   TimingLogger,
 } from './models';
+import { postJson } from './undici-json-post';
 
 // Default per-request timeout for the undici path. Healthy multicalls run in
 // the tens-to-hundreds of milliseconds; without a timeout, a silently dead
@@ -867,7 +868,7 @@ export class Multicall {
   }
   
   /**
-   * Execute with undici fetch for high-performance HTTP with auto-decompression
+   * Execute over the undici pool (request API) for high-performance HTTP
    * @param calls The calls
    * @param options Call options
    */
@@ -876,6 +877,11 @@ export class Multicall {
     options: ContractCallOptions
   ): Promise<AggregateResponse> {
     const customProvider = this.getTypedOptions<MulticallOptionsCustomJsonRpcProvider>();
+    // Captured up front: close() can clear the field while this call awaits.
+    const pool = this._httpPool;
+    if (!pool) {
+      throw new Error('Multicall undici pool is closed');
+    }
     
     // Get cached network ID or fetch it
     const networkId = await this.getCachedNetworkId();
@@ -903,19 +909,17 @@ export class Multicall {
       ],
     };
     
-    // Make the request using undici fetch with pool dispatcher (auto-decompression).
-    // The abort signal also covers response-body consumption below, and firing
-    // it destroys the pooled connection rather than returning it.
+    // Make the request with the pool's request API (see postJson for why not
+    // fetch). The abort signal also covers response-body consumption below,
+    // and firing it destroys the pooled connection rather than returning it.
     const startTime = Date.now();
-    const response = await fetch(customProvider.nodeUrl, {
-      method: 'POST',
+    const response = await postJson(pool, customProvider.nodeUrl, {
       headers: {
         'Content-Type': 'application/json',
         'Accept-Encoding': 'gzip, deflate',
       },
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(this._undiciTimeoutMs),
-      dispatcher: this._httpPool,
     });
     const fetchDuration = Date.now() - startTime;
     
@@ -925,9 +929,9 @@ export class Multicall {
       throw new Error(`HTTP ${response.status}`);
     }
     
-    // Parse the response (fetch auto-decompresses gzip)
+    // Parse the response (postJson decompresses gzip/deflate)
     const jsonStartTime = Date.now();
-    const responseData = await response.json() as {
+    const responseData = JSON.parse(await response.text()) as {
       result?: string;
       error?: { message: string; code: number };
     };
@@ -1224,17 +1228,15 @@ export class Multicall {
         params: [],
       };
       
-      // Use fetch with pool dispatcher (auto-decompression)
+      // Same pool and request path as the multicall itself
       const startTime = Date.now();
-      const response = await fetch(customProvider.nodeUrl, {
-        method: 'POST',
+      const response = await postJson(this._httpPool, customProvider.nodeUrl, {
         headers: {
           'Content-Type': 'application/json',
           'Accept-Encoding': 'gzip, deflate',
         },
         body: JSON.stringify(payload),
         signal: AbortSignal.timeout(this._undiciTimeoutMs),
-        dispatcher: this._httpPool,
       });
       const fetchDuration = Date.now() - startTime;
       
@@ -1245,7 +1247,7 @@ export class Multicall {
       }
       
       const jsonStartTime = Date.now();
-      const responseData = await response.json() as { result: string };
+      const responseData = JSON.parse(await response.text()) as { result: string };
       const jsonDuration = Date.now() - jsonStartTime;
       
       this._cachedNetworkId = parseInt(responseData.result, 16);
