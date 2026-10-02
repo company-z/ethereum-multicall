@@ -18,6 +18,8 @@ import {
   ContractCallOptions,
   TimingLogger,
 } from './models';
+import { callDataCacheKey } from './call-data-cache-key';
+import { encodeAggregateCallData } from './fast-aggregate-encode';
 import { postJson } from './undici-json-post';
 
 // Default per-request timeout for the undici path. Healthy multicalls run in
@@ -118,6 +120,8 @@ export class Multicall {
   private _multicallInterface?: ethers.utils.Interface;
   // Cache for ABI interfaces to avoid recreating them for each call
   private _abiInterfaceCache = new LRUCache<string, ethers.utils.Interface>({ max: 1000 });
+  // Encoded calldata per (ABI, method, primitive params); see call-data-cache-key.ts
+  private _encodedCallCache = new LRUCache<string, string>({ max: 20000 });
   // Cache for output types to avoid repeated ABI lookups (wrapped to allow undefined)
   private _outputTypesCache = new LRUCache<string, { outputs: AbiOutput[] | undefined }>({ max: 5000 });
   
@@ -515,11 +519,21 @@ export class Multicall {
       for (let method = 0; method < contractContext.calls.length; method++) {
         // https://github.com/ethers-io/ethers.js/issues/211
         const methodContext = contractContext.calls[method];
-        // tslint:disable-next-line: no-unused-expression
-        const encodedData = executingInterface.encodeFunctionData(
+        const cacheKey = callDataCacheKey(
+          abiKey,
           methodContext.methodName,
           methodContext.methodParameters
         );
+        let encodedData =
+          cacheKey === undefined ? undefined : this._encodedCallCache.get(cacheKey);
+        if (encodedData === undefined) {
+          // tslint:disable-next-line: no-unused-expression
+          encodedData = executingInterface.encodeFunctionData(
+            methodContext.methodName,
+            methodContext.methodParameters
+          );
+          if (cacheKey !== undefined) this._encodedCallCache.set(cacheKey, encodedData);
+        }
 
         aggregateCallContext.push({
           contractContextIndex: contract,  // No need to clone primitives
@@ -890,9 +904,11 @@ export class Multicall {
     // Encode the call data
     const multicallInterface = this.getMulticallInterface();
     const mappedCalls = this.mapCallContextToMatchContractFormat(calls);
-    const callData = this._options.tryAggregate
-      ? multicallInterface.encodeFunctionData('tryBlockAndAggregate', [false, mappedCalls])
-      : multicallInterface.encodeFunctionData('aggregate', [mappedCalls]);
+    const callData =
+      encodeAggregateCallData(mappedCalls, !!this._options.tryAggregate) ??
+      (this._options.tryAggregate
+        ? multicallInterface.encodeFunctionData('tryBlockAndAggregate', [false, mappedCalls])
+        : multicallInterface.encodeFunctionData('aggregate', [mappedCalls]));
     
     // Build the JSON-RPC request
     const blockTag = options.blockNumber 
