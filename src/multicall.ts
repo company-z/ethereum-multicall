@@ -20,6 +20,7 @@ import {
 } from './models';
 import { callDataCacheKey } from './call-data-cache-key';
 import { encodeAggregateCallData } from './fast-aggregate-encode';
+import { fastDecodeStaticOutputs } from './fast-static-decode';
 import { postJson } from './undici-json-post';
 
 // Default per-request timeout for the undici path. Healthy multicalls run in
@@ -323,7 +324,9 @@ export class Multicall {
             const returnData = this.getReturnDataFromResult(methodContext.result) as unknown as string;
             
             // Try fast path for simple types first (avoids expensive ABI decoder)
-            let decodedReturnValues: any[] | null = this.fastDecodeSimpleType(returnData, outputTypes);
+            let decodedReturnValues: any[] | null =
+              this.fastDecodeSimpleType(returnData, outputTypes) ??
+              fastDecodeStaticOutputs(returnData, outputTypes);
             
             if (decodedReturnValues) {
               fastDecodeCount++;
