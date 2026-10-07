@@ -30,6 +30,8 @@ import { postJson } from './undici-json-post';
 // recovers immediately instead of serving the corpse to retries.
 const DEFAULT_UNDICI_TIMEOUT_MS = 30_000;
 
+const ONE_WORD_HEX = /^0x[0-9a-fA-F]{64}$/;
+
 export class Multicall {
   private readonly ABI = [
     {
@@ -562,6 +564,13 @@ export class Multicall {
   ): any[] | null {
     // Only handle single output cases for now
     if (outputTypes.length !== 1) return null;
+
+    // Exactly one 32-byte word, as fastDecodeStaticOutputs requires. The ABI decoder reads the first
+    // word and ignores the rest; reading the whole buffer instead turns a padded return into a
+    // different value. BSC TraitSniper.com (0x9879406c2ef6578ceb59009d64151ef3f225830b) returns 96
+    // bytes from balanceOf, and BigInt over all of them stored its balance multiplied by 2^768.
+    // Anything else, short or long, goes to the full decoder.
+    if (typeof returnData !== 'string' || !ONE_WORD_HEX.test(returnData)) return null;
     
     const type = outputTypes[0].type;
     
