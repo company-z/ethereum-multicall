@@ -34,10 +34,21 @@ const DEFAULT_UNDICI_TIMEOUT_MS = 30_000;
 
 const ONE_WORD_HEX = /^0x[0-9a-fA-F]{64}$/;
 
-// Per-request lines are debug detail: dropped unless a logger is supplied.
+// Without an injected logger every line still prints, as one JSON line
+// (level, message, fields) so log pipelines can parse it.
+const toJsonLine = (level: string, entry: MulticallLogEntry): string => {
+  try {
+    return JSON.stringify({ level, ...entry }, (_key, value) =>
+      typeof value === 'bigint' ? value.toString() : value
+    );
+  } catch {
+    return JSON.stringify({ level, message: entry.message });
+  }
+};
+
 const DEFAULT_LOGGER: MulticallLogger = {
-  debug: () => {},
-  warn: ({ message, ...fields }) => console.warn(message, fields),
+  debug: (entry) => console.log(toJsonLine('debug', entry)),
+  warn: (entry) => console.warn(toJsonLine('warn', entry)),
 };
 
 // Provider URLs embed API keys in the path (e.g. Alchemy): log the host only.
@@ -149,7 +160,7 @@ export class Multicall {
   private _enableTimingLogs = false;
   private _logger: MulticallLogger = DEFAULT_LOGGER;
   private _timingLogger: TimingLogger = (message, meta) => {
-    this.timingDebug({ ...meta, message: `[multicall-timing] ${message}` });
+    this._logger.debug({ ...meta, message: `[multicall-timing] ${message}` });
   };
 
   constructor(
@@ -213,24 +224,6 @@ export class Multicall {
   public setDefaultLogger(logger: MulticallLogger): void {
     if (this._options.logger === undefined) {
       this._logger = logger;
-    }
-  }
-
-  /**
-   * Debug output the caller opted into with `enableTimingLogs`. Without an
-   * injected logger the default one drops debug, which would make the flag a
-   * no-op, so these lines keep going to console.log in that case.
-   */
-  private timingDebug(entry: MulticallLogEntry): void {
-    if (this._logger !== DEFAULT_LOGGER) {
-      this._logger.debug(entry);
-      return;
-    }
-    const { message, ...fields } = entry;
-    if (Object.keys(fields).length > 0) {
-      console.log(message, fields);
-    } else {
-      console.log(message);
     }
   }
 
@@ -1153,7 +1146,7 @@ export class Multicall {
             ? buf.readUInt32BE(offsetsStart + 28)
             : undefined;
         
-        this.timingDebug({
+        this._logger.debug({
           message: '[multicall] fastDecode structure analysis',
           arrayOffsetBytes,
           arrayLength,

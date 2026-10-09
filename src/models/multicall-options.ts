@@ -53,13 +53,13 @@ interface MulticallOptionsBase {
   enableTimingLogs?: boolean;
   /**
    * Custom logger function for timing logs. Defaults to `logger.debug` with a
-   * [multicall-timing] prefix, or console.log when no `logger` is set.
+   * [multicall-timing] prefix.
    */
   timingLogger?: TimingLogger;
   /**
    * Where the per-request RPC lines (debug) and fast-decode failures (warn)
-   * go. Default: per-request lines are dropped, `enableTimingLogs` output goes
-   * to console.log and warnings go to console.warn.
+   * go. Default: one JSON line per entry (`level`, `message`, fields) on
+   * console.log (debug) and console.warn (warn).
    */
   logger?: MulticallLogger;
 }
