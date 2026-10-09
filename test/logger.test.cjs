@@ -119,4 +119,31 @@ describe('Multicall logger', () => {
     assert.equal(own.entries.debug.length, 1);
     assert.equal(ignored.entries.debug.length, 0);
   });
+
+  it('keeps enableTimingLogs output on the console when no logger is passed', async () => {
+    const original = console.log;
+    const lines = [];
+    console.log = (...args) => lines.push(args);
+    try {
+      await run({ enableTimingLogs: true });
+    } finally {
+      console.log = original;
+    }
+    assert.ok(lines.some(([message]) => String(message).startsWith('[multicall-timing] ')));
+    assert.ok(!lines.some(([message]) => String(message).startsWith('[multicall] calls=')));
+  });
+
+  it('routes enableTimingLogs output to an injected logger instead of the console', async () => {
+    const { entries, logger } = recorder();
+    const original = console.log;
+    const lines = [];
+    console.log = (...args) => lines.push(args);
+    try {
+      await run({ enableTimingLogs: true, logger });
+    } finally {
+      console.log = original;
+    }
+    assert.deepEqual(lines, []);
+    assert.ok(entries.debug.some((e) => e.message.startsWith('[multicall-timing] ')));
+  });
 });

@@ -16,6 +16,7 @@ import {
   MulticallOptionsEthers,
   MulticallOptionsWeb3,
   ContractCallOptions,
+  MulticallLogEntry,
   MulticallLogger,
   TimingLogger,
 } from './models';
@@ -148,7 +149,7 @@ export class Multicall {
   private _enableTimingLogs = false;
   private _logger: MulticallLogger = DEFAULT_LOGGER;
   private _timingLogger: TimingLogger = (message, meta) => {
-    this._logger.debug({ ...meta, message: `[multicall-timing] ${message}` });
+    this.timingDebug({ ...meta, message: `[multicall-timing] ${message}` });
   };
 
   constructor(
@@ -212,6 +213,24 @@ export class Multicall {
   public setDefaultLogger(logger: MulticallLogger): void {
     if (this._options.logger === undefined) {
       this._logger = logger;
+    }
+  }
+
+  /**
+   * Debug output the caller opted into with `enableTimingLogs`. Without an
+   * injected logger the default one drops debug, which would make the flag a
+   * no-op, so these lines keep going to console.log in that case.
+   */
+  private timingDebug(entry: MulticallLogEntry): void {
+    if (this._logger !== DEFAULT_LOGGER) {
+      this._logger.debug(entry);
+      return;
+    }
+    const { message, ...fields } = entry;
+    if (Object.keys(fields).length > 0) {
+      console.log(message, fields);
+    } else {
+      console.log(message);
     }
   }
 
@@ -1134,7 +1153,7 @@ export class Multicall {
             ? buf.readUInt32BE(offsetsStart + 28)
             : undefined;
         
-        this._logger.debug({
+        this.timingDebug({
           message: '[multicall] fastDecode structure analysis',
           arrayOffsetBytes,
           arrayLength,
