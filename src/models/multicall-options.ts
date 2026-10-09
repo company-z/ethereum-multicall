@@ -7,6 +7,24 @@ import { Provider } from '@ethersproject/providers';
  */
 export type TimingLogger = (message: string, meta?: Record<string, unknown>) => void;
 
+/**
+ * One structured log line: `message` for people, every value it interpolates
+ * repeated as a field for queries.
+ */
+export interface MulticallLogEntry {
+  message: string;
+  [field: string]: unknown;
+}
+
+/**
+ * Log sink for the library's own lines. Shaped like the object form of a
+ * winston-style logger, so `@company-z/telemetry`'s `Logger` fits as-is.
+ */
+export interface MulticallLogger {
+  debug(entry: MulticallLogEntry): void;
+  warn(entry: MulticallLogEntry): void;
+}
+
 interface MulticallOptionsBase {
   multicallCustomContractAddress?: string;
   tryAggregate?: boolean;
@@ -34,9 +52,15 @@ interface MulticallOptionsBase {
    */
   enableTimingLogs?: boolean;
   /**
-   * Custom logger function for timing logs. Defaults to console.log with [multicall-timing] prefix.
+   * Custom logger function for timing logs. Defaults to `logger.debug` with a
+   * [multicall-timing] prefix.
    */
   timingLogger?: TimingLogger;
+  /**
+   * Where the per-request RPC lines (debug) and fast-decode failures (warn)
+   * go. Default: debug lines are dropped, warnings go to console.warn.
+   */
+  logger?: MulticallLogger;
 }
 
 export interface MulticallOptionsWeb3 extends MulticallOptionsBase {

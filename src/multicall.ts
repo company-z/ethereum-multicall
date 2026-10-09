@@ -16,6 +16,7 @@ import {
   MulticallOptionsEthers,
   MulticallOptionsWeb3,
   ContractCallOptions,
+  MulticallLogger,
   TimingLogger,
 } from './models';
 import { callDataCacheKey } from './call-data-cache-key';
@@ -31,6 +32,21 @@ import { postJson } from './undici-json-post';
 const DEFAULT_UNDICI_TIMEOUT_MS = 30_000;
 
 const ONE_WORD_HEX = /^0x[0-9a-fA-F]{64}$/;
+
+// Per-request lines are debug detail: dropped unless a logger is supplied.
+const DEFAULT_LOGGER: MulticallLogger = {
+  debug: () => {},
+  warn: ({ message, ...fields }) => console.warn(message, fields),
+};
+
+// Provider URLs embed API keys in the path (e.g. Alchemy): log the host only.
+const hostOf = (nodeUrl: string): string => {
+  try {
+    return new URL(nodeUrl).host;
+  } catch {
+    return 'unparseable-url';
+  }
+};
 
 export class Multicall {
   private readonly ABI = [
@@ -130,12 +146,9 @@ export class Multicall {
   
   // Timing infrastructure
   private _enableTimingLogs = false;
+  private _logger: MulticallLogger = DEFAULT_LOGGER;
   private _timingLogger: TimingLogger = (message, meta) => {
-    if (meta) {
-      console.log(`[multicall-timing] ${message}`, meta);
-    } else {
-      console.log(`[multicall-timing] ${message}`);
-    }
+    this._logger.debug({ ...meta, message: `[multicall-timing] ${message}` });
   };
 
   constructor(
@@ -150,6 +163,9 @@ export class Multicall {
     }
     if (this._options.timingLogger !== undefined) {
       this._timingLogger = this._options.timingLogger;
+    }
+    if (this._options.logger !== undefined) {
+      this._logger = this._options.logger;
     }
     
     if ((this._options as MulticallOptionsWeb3).web3Instance) {
@@ -189,6 +205,16 @@ export class Multicall {
     );
   }
   
+  /**
+   * Set the logger used when the constructor options did not pass one, so a
+   * wrapping library can route an instance it was handed into its own logger.
+   */
+  public setDefaultLogger(logger: MulticallLogger): void {
+    if (this._options.logger === undefined) {
+      this._logger = logger;
+    }
+  }
+
   /**
    * Log timing information if timing logs are enabled.
    */
@@ -965,17 +991,16 @@ export class Multicall {
     };
     const jsonDuration = Date.now() - jsonStartTime;
     
-    // Log the RPC host only — provider URLs embed API keys in the path
-    // (e.g. Alchemy), so the full URL must never reach logs.
-    let nodeHost: string;
-    try {
-      nodeHost = new URL(customProvider.nodeUrl).host;
-    } catch {
-      nodeHost = 'unparseable-url';
-    }
-    console.log(
-      `[multicall] calls=${calls.length} block=${blockTag} compression=${contentEncoding} fetch=${fetchDuration}ms json=${jsonDuration}ms host=${nodeHost}`
-    );
+    const nodeHost = hostOf(customProvider.nodeUrl);
+    this._logger.debug({
+      message: `[multicall] calls=${calls.length} block=${blockTag} compression=${contentEncoding} fetch=${fetchDuration}ms json=${jsonDuration}ms host=${nodeHost}`,
+      calls: calls.length,
+      blockTag,
+      compression: contentEncoding,
+      fetchDurationMs: fetchDuration,
+      jsonDurationMs: jsonDuration,
+      host: nodeHost,
+    });
     
     if (responseData.error) {
       throw new Error(`RPC Error: ${responseData.error.message} (code: ${responseData.error.code})`);
@@ -1109,7 +1134,8 @@ export class Multicall {
             ? buf.readUInt32BE(offsetsStart + 28)
             : undefined;
         
-        console.log('[multicall] fastDecode structure analysis:', {
+        this._logger.debug({
+          message: '[multicall] fastDecode structure analysis',
           arrayOffsetBytes,
           arrayLength,
           offsetsStart,
@@ -1230,7 +1256,11 @@ export class Multicall {
    */
   private logFastDecodeFailure(reason: string, meta: Record<string, unknown>): void {
     if (!this._enableTimingLogs) return;
-    console.warn(`[multicall] fastDecode FAILED: ${reason}`, meta);
+    this._logger.warn({
+      ...meta,
+      message: `[multicall] fastDecode FAILED: ${reason}`,
+      reason,
+    });
   }
   
   /**
@@ -1280,17 +1310,15 @@ export class Multicall {
       
       this._cachedNetworkId = parseInt(responseData.result, 16);
       
-      // Log the RPC host only — provider URLs embed API keys in the path
-      // (e.g. Alchemy), so the full URL must never reach logs.
-      let chainIdNodeHost: string;
-      try {
-        chainIdNodeHost = new URL(customProvider.nodeUrl).host;
-      } catch {
-        chainIdNodeHost = 'unparseable-url';
-      }
-      console.log(
-        `[eth_chainId] networkId=${this._cachedNetworkId} compression=${contentEncoding} fetch=${fetchDuration}ms json=${jsonDuration}ms host=${chainIdNodeHost}`
-      );
+      const chainIdNodeHost = hostOf(customProvider.nodeUrl);
+      this._logger.debug({
+        message: `[eth_chainId] networkId=${this._cachedNetworkId} compression=${contentEncoding} fetch=${fetchDuration}ms json=${jsonDuration}ms host=${chainIdNodeHost}`,
+        networkId: this._cachedNetworkId,
+        compression: contentEncoding,
+        fetchDurationMs: fetchDuration,
+        jsonDurationMs: jsonDuration,
+        host: chainIdNodeHost,
+      });
       
       return this._cachedNetworkId;
     }
